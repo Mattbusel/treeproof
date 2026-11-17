@@ -15,6 +15,8 @@ pub const PREDICATE_TYPE: &str = "https://in-toto.io/attestation/test-result/v0.
 pub const RUN_DESCRIPTOR: &str = "treeproof-run";
 /// Name of the subject descriptor.
 pub const SUBJECT_NAME: &str = "worktree";
+/// Media type of the configuration descriptors that carry nested-repository digests.
+pub const NESTED_MEDIA_TYPE: &str = "application/vnd.treeproof.nested-tree";
 /// Version of the run-record layout inside the annotations.
 pub const RUN_SCHEMA: &str = "https://github.com/Mattbusel/treeproof/blob/main/SPEC.md#run-record-v1";
 
@@ -122,6 +124,31 @@ impl Receipt {
     pub fn passed(&self) -> bool {
         self.statement.predicate.result == "PASSED"
     }
+
+    /// `PASSED` or `WARNED`.
+    pub fn passed_or_warned(&self) -> bool {
+        matches!(self.statement.predicate.result.as_str(), "PASSED" | "WARNED")
+    }
+
+    /// The command as one line (shell commands as written, argv joined with quoting).
+    pub fn command_line(&self) -> String {
+        if self.run.shell {
+            self.run.argv.join(" ")
+        } else {
+            crate::util::join_argv(&self.run.argv)
+        }
+    }
+
+    /// Working-tree digests of nested repositories recorded with the run (SPEC.md, section 4.1).
+    pub fn nested_trees(&self) -> BTreeMap<String, String> {
+        self.statement
+            .predicate
+            .configuration
+            .iter()
+            .filter(|d| d.media_type.as_deref() == Some(NESTED_MEDIA_TYPE))
+            .filter_map(|d| Some((d.name.clone()?, d.digest.get("gitTree")?.clone())))
+            .collect()
+    }
 }
 
 /// Assemble the statement for a run.
@@ -130,6 +157,18 @@ pub fn build_statement(
     result: &str,
     run: &RunInfo,
     lockfiles: &BTreeMap<String, String>,
+    summary: &Summary,
+) -> Result<Statement> {
+    build_statement_with_nested(tree, result, run, lockfiles, &BTreeMap::new(), summary)
+}
+
+/// Assemble the statement for a run, with nested-repository digests (path to git tree id).
+pub fn build_statement_with_nested(
+    tree: &str,
+    result: &str,
+    run: &RunInfo,
+    lockfiles: &BTreeMap<String, String>,
+    nested: &BTreeMap<String, String>,
     summary: &Summary,
 ) -> Result<Statement> {
     let mut subject_digest = BTreeMap::new();
@@ -151,6 +190,16 @@ pub fn build_statement(
         let mut d = BTreeMap::new();
         d.insert("sha256".to_string(), sha.clone());
         configuration.push(ResourceDescriptor { name: Some(path.clone()), digest: d, ..Default::default() });
+    }
+    for (path, t) in nested {
+        let mut d = BTreeMap::new();
+        d.insert("gitTree".to_string(), t.clone());
+        configuration.push(ResourceDescriptor {
+            name: Some(path.clone()),
+            digest: d,
+            media_type: Some(NESTED_MEDIA_TYPE.to_string()),
+            ..Default::default()
+        });
     }
     Ok(Statement {
         type_: STATEMENT_TYPE.to_string(),
@@ -196,11 +245,10 @@ pub fn open(env: &Envelope, trusted: &[PublicKey]) -> Result<Receipt> {
     if !matches!(statement.predicate.result.as_str(), "PASSED" | "WARNED" | "FAILED") {
         return Err(Error::new(format!("invalid result {:?}", statement.predicate.result)));
     }
-    let tree = statement
-        .subject
-        .iter()
-        .find_map(|s| s.digest.get("gitTree").cloned())
-        .ok_or_else(|| Error::new("statement subject has no gitTree digest"))?;
+    if statement.subject.len() != 1 {
+        return Err(Error::new(format!("statement must have exactly one subject, not {}", statement.subject.len())));
+    }
+    let tree = statement.subject[0].digest.get("gitTree").cloned().ok_or_else(|| Error::new("statement subject has no gitTree digest"))?;
     if !crate::util::is_git_oid(&tree) {
         return Err(Error::new("subject gitTree is not a git object id"));
     }
@@ -224,4 +272,44 @@ pub fn open(env: &Envelope, trusted: &[PublicKey]) -> Result<Receipt> {
 /// Parse and verify receipt text in one step.
 pub fn open_text(text: &str, trusted: &[PublicKey]) -> Result<Receipt> {
     open(&parse_envelope(text)?, trusted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signed(st: &Statement) -> (String, PublicKey) {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let env = sign_statement(&sk, st).unwrap();
+        (serde_json::to_string(&env).unwrap(), PublicKey { key: sk.verifying_key() })
+    }
+
+    fn statement() -> Statement {
+        let run = RunInfo {
+            schema: RUN_SCHEMA.into(),
+            argv: vec!["cargo".into(), "test".into()],
+            cwd: ".".into(),
+            cache_key: "ab".repeat(32),
+            mode: MODE_FRESH.into(),
+            ..Default::default()
+        };
+        let mut nested = BTreeMap::new();
+        nested.insert("vendor/lib".to_string(), "cd".repeat(20));
+        build_statement_with_nested(&"ef".repeat(20), "PASSED", &run, &BTreeMap::new(), &nested, &Summary::default()).unwrap()
+    }
+
+    #[test]
+    fn exactly_one_subject() {
+        let st = statement();
+        let (text, pk) = signed(&st);
+        let r = open_text(&text, std::slice::from_ref(&pk)).unwrap();
+        assert_eq!(r.tree, "ef".repeat(20));
+        assert_eq!(r.nested_trees().get("vendor/lib"), Some(&"cd".repeat(20)));
+        let mut two = st.clone();
+        two.subject.push(two.subject[0].clone());
+        two.subject[1].digest.insert("gitTree".into(), "12".repeat(20));
+        let (text, pk) = signed(&two);
+        let err = open_text(&text, std::slice::from_ref(&pk)).unwrap_err();
+        assert!(err.to_string().contains("exactly one subject"), "{err}");
+    }
 }

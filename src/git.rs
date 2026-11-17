@@ -71,8 +71,104 @@ impl Drop for TempIndex {
     }
 }
 
+/// Resolve a revision to a commit id. Errors when it does not name a commit.
+pub fn resolve_commit(root: &Path, rev: &str) -> Result<String> {
+    if rev.starts_with('-') {
+        return Err(Error::new(format!("invalid revision {rev:?}")));
+    }
+    let mut c = git_cmd(root);
+    c.args(["rev-parse", "--verify", "--quiet", &format!("{rev}^{{commit}}")]);
+    match run_git(c, "rev-parse") {
+        Ok(s) if crate::util::is_git_oid(&s) => Ok(s),
+        _ => Err(Error::new(format!("{rev:?} does not name a commit in {}", root.display()))),
+    }
+}
+
+/// Contents of `path` (relative to the repository root, `/`-separated) at commit `rev`,
+/// or `None` when the file does not exist there.
+pub fn show_file(root: &Path, rev: &str, path: &str) -> Result<Option<String>> {
+    let commit = resolve_commit(root, rev)?;
+    let spec = format!("{commit}:{path}");
+    let mut probe = git_cmd(root);
+    probe.args(["cat-file", "-e", &spec]);
+    let exists = probe.output().map_err(|e| Error::new(format!("could not run git (cat-file): {e}")))?.status.success();
+    if !exists {
+        return Ok(None);
+    }
+    let mut c = git_cmd(root);
+    c.args(["cat-file", "blob", &spec]);
+    let out = c.output().map_err(|e| Error::new(format!("could not run git (cat-file): {e}")))?;
+    if !out.status.success() {
+        return Err(Error::new(format!("git cat-file {spec} failed: {}", String::from_utf8_lossy(&out.stderr).trim())));
+    }
+    String::from_utf8(out.stdout).map(Some).map_err(|_| Error::new(format!("{spec} is not UTF-8")))
+}
+
+/// File names directly inside directory `dir` (relative to the root) at commit `rev`.
+pub fn list_dir(root: &Path, rev: &str, dir: &str) -> Result<Vec<String>> {
+    let commit = resolve_commit(root, rev)?;
+    let mut c = git_cmd(root);
+    c.args(["ls-tree", "--name-only", &commit, "--", &format!("{}/", dir.trim_end_matches('/'))]);
+    let s = run_git(c, "ls-tree")?;
+    Ok(s.lines().filter(|l| !l.is_empty()).map(String::from).collect())
+}
+
+/// Tree id of the merge base of `HEAD` and its upstream branch, when there is one.
+pub fn upstream_base_tree(root: &Path) -> Option<String> {
+    let mut c = git_cmd(root);
+    c.args(["merge-base", "HEAD", "@{upstream}"]);
+    let base = run_git(c, "merge-base").ok().filter(|s| crate::util::is_git_oid(s))?;
+    let mut t = git_cmd(root);
+    t.args(["rev-parse", "--verify", "--quiet", &format!("{base}^{{tree}}")]);
+    run_git(t, "rev-parse").ok().filter(|s| crate::util::is_git_oid(s))
+}
+
 /// Git tree id of the working tree rooted at `root` (see the module docs).
 pub fn tree_digest(root: &Path) -> Result<String> {
+    tree_digest_and_links(root).map(|(t, _)| t)
+}
+
+/// Working-tree digests of the git repositories nested in the tree at `root` (initialised
+/// submodules and embedded repositories), keyed by path relative to `root`.
+///
+/// The tree digest records a nested repository only as a gitlink (its `HEAD` commit), so
+/// edits inside it do not change the digest. These digests cover that content; receipts carry
+/// them as configuration descriptors and the gate compares them (see SPEC.md, section 4.1).
+pub fn nested_trees(root: &Path) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut out = std::collections::BTreeMap::new();
+    let (_, links) = tree_digest_and_links(root)?;
+    collect_nested(root, "", links, 0, &mut out)?;
+    Ok(out)
+}
+
+const MAX_NESTING: usize = 4;
+
+fn collect_nested(
+    root: &Path,
+    prefix: &str,
+    links: Vec<String>,
+    depth: usize,
+    out: &mut std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    if depth >= MAX_NESTING {
+        return Ok(());
+    }
+    for rel in links {
+        let dir = root.join(&rel);
+        // An uninitialised submodule is an empty directory: nothing in it can change.
+        if !dir.join(".git").exists() {
+            continue;
+        }
+        let (tree, inner) = tree_digest_and_links(&dir)?;
+        let key = format!("{prefix}{rel}");
+        out.insert(key.clone(), tree);
+        collect_nested(&dir, &format!("{key}/"), inner, depth + 1, out)?;
+    }
+    Ok(())
+}
+
+/// The tree digest plus the paths of gitlinks (nested repositories) in it.
+pub fn tree_digest_and_links(root: &Path) -> Result<(String, Vec<String>)> {
     let real = index_path(root)?;
     let mut rnd = [0u8; 8];
     let _ = getrandom::fill(&mut rnd);
@@ -107,11 +203,28 @@ pub fn tree_digest(root: &Path) -> Result<String> {
     wt.env("GIT_INDEX_FILE", &tmp);
     wt.arg("write-tree");
     let oid = run_git(wt, "write-tree")?;
+
+    let mut ls = git_cmd(root);
+    ls.env("GIT_INDEX_FILE", &tmp);
+    ls.args(["ls-files", "--stage", "-z"]);
+    let out = ls.output().map_err(|e| Error::new(format!("could not run git (ls-files): {e}")))?;
+    let links: Vec<String> = if out.status.success() {
+        out.stdout
+            .split(|b| *b == 0)
+            .filter(|e| e.starts_with(b"160000 "))
+            .filter_map(|e| {
+                let tab = e.iter().position(|b| *b == b'\t')?;
+                Some(String::from_utf8_lossy(&e[tab + 1..]).into_owned())
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     drop(guard);
     if !crate::util::is_git_oid(&oid) {
         return Err(Error::new(format!("git write-tree returned an unexpected id: {oid:?}")));
     }
-    Ok(oid)
+    Ok((oid, links))
 }
 
 /// Path of `dir` relative to `root`, with forward slashes; `"."` for the root itself.

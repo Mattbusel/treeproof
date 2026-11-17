@@ -78,6 +78,9 @@ proptest! {
         let v = serde_json::json!({"tool_name": tool, "tool_input": {"command": cmd}, "tool_response": {"stdout": out}});
         let _ = treeproof::hooks::tool_output_text(&v["tool_response"]);
         let _ = treeproof::hooks::looks_like_test_command(&cmd);
+        let _ = treeproof::hooks::observable_test_command(&cmd);
+        let _ = treeproof::hooks::forbidden_shell_command(&cmd);
+        let _ = treeproof::parse::subset_reason(&treeproof::parse::command_words(std::slice::from_ref(&cmd), true), &[]);
         let _ = treeproof::hooks::detect_host(&v);
         let _ = treeproof::fileguard::patch_paths(&cmd, std::path::Path::new("/r"));
     }

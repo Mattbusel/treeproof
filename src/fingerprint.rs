@@ -3,7 +3,9 @@
 //! key = SHA-256 over a canonical JSON object holding the working-tree digest,
 //! the argv, the working directory relative to the repository root, toolchain
 //! versions for the runners the command uses, lockfile hashes, allowlisted
-//! environment variables (hashed), and the OS and architecture.
+//! environment variables (HMAC-SHA256 under a per-machine secret, so values
+//! cannot be guessed from a published receipt), the working-tree digests of
+//! nested repositories, and the OS and architecture.
 
 use crate::util::sha256_hex;
 use crate::Result;
@@ -134,41 +136,82 @@ pub fn lockfiles(root: &Path, cwd: &Path) -> BTreeMap<String, String> {
     out
 }
 
-/// Hashed values of the allowlisted environment variables.
-pub fn env_values(extra: &[String]) -> BTreeMap<String, Option<String>> {
+/// Keyed values of the allowlisted environment variables: HMAC-SHA256 of the value under
+/// `salt` (a per-machine secret, see [`crate::store::Store::env_salt`]), or `None` when unset.
+pub fn env_values_salted(extra: &[String], salt: &[u8]) -> BTreeMap<String, Option<String>> {
     let mut out = BTreeMap::new();
     for name in DEFAULT_ENV.iter().map(|s| s.to_string()).chain(extra.iter().cloned()) {
-        let v = std::env::var_os(&name).map(|v| sha256_hex(v.to_string_lossy().as_bytes()));
+        let v = std::env::var_os(&name).map(|v| crate::util::hmac_sha256_hex(salt, v.to_string_lossy().as_bytes()));
         out.insert(name, v);
     }
     out
 }
 
-/// Compute the full fingerprint for running `argv` in `cwd` inside the repository at `root`.
+/// Keyed values of the allowlisted environment variables, using the default store's salt.
+pub fn env_values(extra: &[String]) -> BTreeMap<String, Option<String>> {
+    let salt = crate::store::Store::open().and_then(|s| s.env_salt()).unwrap_or_else(|_| {
+        // No store: a throwaway salt still never exposes a plain hash; it only costs cache hits.
+        let mut r = [0u8; 32];
+        let _ = getrandom::fill(&mut r);
+        r.to_vec()
+    });
+    env_values_salted(extra, &salt)
+}
+
+/// Compute the full fingerprint for running `argv` in `cwd` inside the repository at `root`,
+/// using the default store's environment salt.
 pub fn compute(root: &Path, cwd: &Path, argv: &[String], shell: bool, extra_env: &[String]) -> Result<Fingerprint> {
     let tree = crate::git::tree_digest(root)?;
     Ok(with_tree(tree, root, cwd, argv, shell, extra_env))
 }
 
-/// Fingerprint for an already-computed tree digest.
+/// Fingerprint for an already-computed tree digest, using the default store's environment salt.
 pub fn with_tree(tree: String, root: &Path, cwd: &Path, argv: &[String], shell: bool, extra_env: &[String]) -> Fingerprint {
-    let mut f = Fingerprint {
+    let mut f = base(tree, root, cwd, argv, shell);
+    f.env = env_values(extra_env);
+    f.key = key_of(&f, argv, shell);
+    f
+}
+
+fn base(tree: String, root: &Path, cwd: &Path, argv: &[String], shell: bool) -> Fingerprint {
+    Fingerprint {
         tree,
         key: String::new(),
         cwd: crate::git::rel_path(root, cwd),
         toolchains: toolchains(cwd, argv, shell),
         lockfiles: lockfiles(root, cwd),
-        env: env_values(extra_env),
+        env: BTreeMap::new(),
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
-    };
-    f.key = key_of(&f, argv, shell);
-    f
+    }
+}
+
+/// Everything `run` needs: the fingerprint (with nested-repository digests folded into its key)
+/// and those digests.
+pub fn compute_full(
+    root: &Path,
+    cwd: &Path,
+    argv: &[String],
+    shell: bool,
+    extra_env: &[String],
+    salt: &[u8],
+) -> Result<(Fingerprint, BTreeMap<String, String>)> {
+    let tree = crate::git::tree_digest(root)?;
+    let nested = crate::git::nested_trees(root)?;
+    let mut f = base(tree, root, cwd, argv, shell);
+    f.env = env_values_salted(extra_env, salt);
+    f.key = key_with_nested(&f, argv, shell, &nested);
+    Ok((f, nested))
 }
 
 /// The canonical key computation (documented in SPEC.md).
 pub fn key_of(f: &Fingerprint, argv: &[String], shell: bool) -> String {
-    let v = serde_json::json!({
+    key_with_nested(f, argv, shell, &BTreeMap::new())
+}
+
+/// The canonical key, with the working-tree digests of nested repositories (omitted when empty).
+pub fn key_with_nested(f: &Fingerprint, argv: &[String], shell: bool, nested: &BTreeMap<String, String>) -> String {
+    let mut v = serde_json::json!({
         "v": 1,
         "tree": f.tree,
         "argv": argv,
@@ -180,6 +223,9 @@ pub fn key_of(f: &Fingerprint, argv: &[String], shell: bool) -> String {
         "os": f.os,
         "arch": f.arch,
     });
+    if !nested.is_empty() {
+        v["nested"] = serde_json::json!(nested);
+    }
     sha256_hex(v.to_string().as_bytes())
 }
 

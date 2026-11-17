@@ -22,4 +22,5 @@ The repository also ships a Codex plugin manifest (`plugin/.codex-plugin/plugin.
 - Codex `Stop` expects JSON on stdout when the hook exits 0, so treeproof always prints `{}` when it allows a stop.
 - Codex has no `TaskCompleted` event; the `Stop` gate covers it.
 - File edits arrive as `apply_patch`. FileGuard reads the `*** Update File:` / `*** Delete File:` / `*** Add File:` lines of the patch to find the paths.
-- `PostToolUse` for Bash also runs after commands that exit non-zero. When Codex reports an exit code, treeproof records it in the observed receipt.
+- `PostToolUse` for Bash also runs after commands that exit non-zero. When Codex reports an exit code, treeproof records it in the observed receipt. Observed passes do not satisfy the gate unless the committed policy sets `accept_observed`.
+- If Codex does not send `SessionStart`, the first `PreToolUse` or `PostToolUse` call records the session's baseline tree and policy snapshot.

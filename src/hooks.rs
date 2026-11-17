@@ -7,8 +7,13 @@
 //!
 //! Hooks fail open: an internal error is reported to the user as a warning and
 //! never blocks the agent, so a broken install cannot wedge a session.
+//!
+//! The first hook call of a session (normally `SessionStart`, otherwise the first
+//! `PreToolUse`/`PostToolUse`) records the session's baseline tree and a snapshot of the
+//! policy committed at `HEAD`. The gate uses that snapshot, so writing or committing a
+//! different `treeproof.toml` during the session changes nothing.
 
-use crate::config::Config;
+use crate::config::{Config, CONFIG_FILE};
 use crate::fileguard;
 use crate::otlp::{self, Evaluation, Label};
 use crate::store::{write_atomic, Store};
@@ -40,6 +45,46 @@ struct SessionState {
     started_at: Option<String>,
     #[serde(default)]
     blocks: BTreeMap<String, u32>,
+    /// `treeproof.toml` as committed at `HEAD` when the session started ("" when absent).
+    #[serde(default)]
+    policy: Option<String>,
+}
+
+impl SessionState {
+    /// The session's policy: the snapshot, or (for state written by older versions) `HEAD`'s.
+    fn config(&self, root: &Path) -> Result<Config> {
+        match &self.policy {
+            Some(t) if t.trim().is_empty() => Ok(Config::default()),
+            Some(t) => Config::parse(t),
+            None => Config::load_committed(root),
+        }
+    }
+}
+
+/// `treeproof.toml` text committed at `HEAD` ("" when absent or on an unborn branch).
+fn committed_policy_text(root: &Path) -> Result<String> {
+    if crate::git::head_commit(root).is_none() {
+        return Ok(String::new());
+    }
+    let (_, text) = Config::load_at_rev(root, "HEAD")?;
+    Ok(text)
+}
+
+/// Load the session state, creating it (baseline tree and policy snapshot) on first use.
+fn ensure_state(store: &Store, session: &str, root: &Path) -> Result<SessionState> {
+    if let Some(st) = load_state(store, session) {
+        if st.start_tree.is_some() {
+            return Ok(st);
+        }
+    }
+    let st = SessionState {
+        start_tree: Some(crate::git::tree_digest(root)?),
+        started_at: Some(crate::util::rfc3339_ms(crate::util::now_ms())),
+        blocks: BTreeMap::new(),
+        policy: Some(committed_policy_text(root)?),
+    };
+    save_state(store, session, &st)?;
+    Ok(st)
 }
 
 const GATE_KIND: &str = "gate";
@@ -98,23 +143,35 @@ fn session_start(input: &Value) -> Result<HookOutput> {
     let cwd = cwd_of(input);
     let Ok(root) = crate::git::repo_root(&cwd) else { return Ok(HookOutput::silent()) };
     let store = Store::open()?;
-    let sid = session_of(input);
-    if load_state(&store, &sid).and_then(|s| s.start_tree).is_none() {
-        let tree = crate::git::tree_digest(&root)?;
-        let st = SessionState {
-            start_tree: Some(tree),
-            started_at: Some(crate::util::rfc3339_ms(crate::util::now_ms())),
-            blocks: BTreeMap::new(),
-        };
-        save_state(&store, &sid, &st)?;
-    }
+    ensure_state(&store, &session_of(input), &root)?;
     Ok(HookOutput::silent())
 }
 
 fn stop(input: &Value, ev: &str) -> Result<HookOutput> {
     let cwd = cwd_of(input);
     let Ok(root) = crate::git::repo_root(&cwd) else { return Ok(HookOutput::allow_json()) };
-    let cfg = Config::load(&root)?;
+    let store = Store::open()?;
+    let sid = session_of(input);
+    let tree = crate::git::tree_digest(&root)?;
+    let mut state = match load_state(&store, &sid).filter(|s| s.start_tree.is_some()) {
+        Some(s) => s,
+        None => {
+            // No record of how this session started (the plugin was enabled mid-session, or the
+            // host sent no earlier hook). Commits made in the session would hide changes from a
+            // HEAD baseline, so compare with where the branch left its upstream when there is
+            // one, and with HEAD otherwise.
+            let baseline = crate::git::upstream_base_tree(&root).or_else(|| crate::git::head_tree(&root));
+            let st = SessionState {
+                start_tree: baseline,
+                started_at: Some(crate::util::rfc3339_ms(crate::util::now_ms())),
+                blocks: BTreeMap::new(),
+                policy: Some(committed_policy_text(&root)?),
+            };
+            save_state(&store, &sid, &st)?;
+            st
+        }
+    };
+    let cfg = state.config(&root)?;
     let mode = gate_mode(&cfg);
     if mode == "off" {
         return Ok(HookOutput::allow_json());
@@ -122,12 +179,7 @@ fn stop(input: &Value, ev: &str) -> Result<HookOutput> {
     if ev == "SubagentStop" && std::env::var("TREEPROOF_GATE_SUBAGENTS").map(|v| v != "1").unwrap_or(true) {
         return Ok(HookOutput::allow_json());
     }
-    let store = Store::open()?;
-    let sid = session_of(input);
-    let tree = crate::git::tree_digest(&root)?;
-    let mut state = load_state(&store, &sid).unwrap_or_default();
-    let baseline = state.start_tree.clone().or_else(|| crate::git::head_tree(&root));
-    if baseline.as_deref() == Some(tree.as_str()) {
+    if state.start_tree.as_deref() == Some(tree.as_str()) {
         return Ok(HookOutput::allow_json());
     }
 
@@ -233,7 +285,71 @@ fn bash_command(input: &Value) -> Option<String> {
     }
 }
 
-/// Does a shell command look like it runs tests?
+fn is_assignment(w: &str) -> bool {
+    match w.split_once('=') {
+        Some((name, _)) => !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+        None => false,
+    }
+}
+
+/// Is this a plain invocation of a known test runner whose output can be recorded as an
+/// observed run? Only one command, optionally after `cd <dir> &&`, environment assignments and
+/// a launcher (`uv run`, `npx`, ...), with nothing chained, piped, redirected or substituted,
+/// so the output the host captured is the runner's own.
+pub fn observable_test_command(cmd: &str) -> bool {
+    let mut c = cmd.trim();
+    if c.to_ascii_lowercase().contains("treeproof") {
+        return false;
+    }
+    if let Some(rest) = c.strip_prefix("cd ") {
+        let Some((dir, tail)) = rest.split_once("&&") else { return false };
+        if dir.trim().is_empty() || dir.contains(|ch: char| "|;&<>`$(){}\n\r".contains(ch)) {
+            return false;
+        }
+        c = tail.trim();
+    }
+    let c = c.strip_suffix("2>&1").map(str::trim_end).unwrap_or(c);
+    if c.contains(|ch: char| "|;&<>`$(){}\n\r".contains(ch)) {
+        return false;
+    }
+    let w: Vec<String> = c.split_whitespace().map(|x| x.trim_matches(|q| q == '"' || q == '\'').to_string()).collect();
+    let mut i = 0;
+    loop {
+        while i < w.len() && (is_assignment(&w[i]) || crate::parse::prog_name(&w[i]) == "env") {
+            i += 1;
+        }
+        let Some(p) = w.get(i).map(|x| crate::parse::prog_name(x)) else { return false };
+        let next = w.get(i + 1).map(|s| s.as_str());
+        match (p.as_str(), next) {
+            ("uv" | "poetry" | "pdm" | "pipenv" | "hatch" | "rye", Some("run")) | ("pnpm", Some("exec" | "dlx")) => i += 2,
+            ("npx" | "bunx" | "pnpx", _) => i += 1,
+            ("yarn", Some("jest" | "vitest" | "pytest")) => i += 1,
+            _ => break,
+        }
+    }
+    let p = crate::parse::prog_name(&w[i]);
+    let mut rest: Vec<&str> = w[i + 1..].iter().map(|s| s.as_str()).collect();
+    if p == "cargo" && rest.first().is_some_and(|a| a.starts_with('+')) {
+        rest.remove(0);
+    }
+    let first = rest.first().copied();
+    let second = rest.get(1).copied();
+    match p.as_str() {
+        "cargo" => matches!(first, Some("test" | "t" | "nextest")),
+        "cargo-nextest" | "pytest" | "py.test" | "jest" | "vitest" | "tox" | "nox" => true,
+        "python" | "python3" | "py" => rest
+            .iter()
+            .position(|a| *a == "-m")
+            .is_some_and(|m| rest[..m].iter().all(|a| a.starts_with('-')) && matches!(rest.get(m + 1), Some(&"pytest") | Some(&"tox"))),
+        "go" => first == Some("test"),
+        "npm" => matches!(first, Some("test" | "t" | "tst")) || (first == Some("run") && second == Some("test")),
+        "pnpm" | "yarn" | "bun" => first == Some("test") || (first == Some("run") && second == Some("test")),
+        _ => false,
+    }
+}
+
+/// Does a shell command look like it runs tests? (A loose check; recording uses
+/// [`observable_test_command`].)
 pub fn looks_like_test_command(cmd: &str) -> bool {
     let c = cmd.to_ascii_lowercase();
     if c.contains("treeproof") {
@@ -279,24 +395,34 @@ fn file_paths(input: &Value, cwd: &Path) -> Vec<PathBuf> {
     }
 }
 
-fn fileguard_enabled(cwd: &Path) -> bool {
+fn fileguard_enabled(state: Option<&SessionState>, root: Option<&Path>) -> bool {
     if std::env::var("TREEPROOF_FILEGUARD").map(|v| v == "0" || v.eq_ignore_ascii_case("off")).unwrap_or(false) {
         return false;
     }
-    match crate::git::repo_root(cwd) {
-        Ok(root) => Config::load(&root).map(|c| c.fileguard.enabled).unwrap_or(true),
-        Err(_) => true,
+    match (state, root) {
+        (Some(st), Some(r)) => st.config(r).map(|c| c.fileguard.enabled).unwrap_or(true),
+        (None, Some(r)) => Config::load_committed(r).map(|c| c.fileguard.enabled).unwrap_or(true),
+        _ => true,
     }
+}
+
+/// The repository root and session state for a tool hook (creating the state on first use).
+fn tool_context(input: &Value, store: &Store) -> (Option<PathBuf>, Option<SessionState>) {
+    let Ok(root) = crate::git::repo_root(&cwd_of(input)) else { return (None, None) };
+    let st = ensure_state(store, &session_of(input), &root).ok();
+    (Some(root), st)
 }
 
 fn post_tool_use(input: &Value) -> Result<HookOutput> {
     let tool = str_field(input, "tool_name").unwrap_or("");
     let cwd = cwd_of(input);
     let sid = session_of(input);
+    let store = Store::open()?;
+    let (root, state) = tool_context(input, &store);
     match tool {
         "Bash" | "exec_command" | "shell" => {
             let Some(cmd) = bash_command(input) else { return Ok(HookOutput::silent()) };
-            if !looks_like_test_command(&cmd) || crate::git::repo_root(&cwd).is_err() {
+            if !observable_test_command(&cmd) || root.is_none() {
                 return Ok(HookOutput::silent());
             }
             let resp = input.get("tool_response").cloned().unwrap_or(Value::Null);
@@ -322,8 +448,7 @@ fn post_tool_use(input: &Value) -> Result<HookOutput> {
             Ok(HookOutput::silent())
         }
         "Read" | "Edit" | "Write" | "MultiEdit" | "NotebookEdit" | "apply_patch" => {
-            if fileguard_enabled(&cwd) {
-                let store = Store::open()?;
+            if fileguard_enabled(state.as_ref(), root.as_deref()) {
                 fileguard::record(&store, &sid, &file_paths(input, &cwd))?;
             }
             Ok(HookOutput::silent())
@@ -354,14 +479,67 @@ pub fn forbidden_shell_command(cmd: &str) -> Option<&'static str> {
     if c.contains("treeproof_cache_dir") || c.contains("treeproof/v1/") || c.contains("treeproof\\v1\\") {
         return Some("the treeproof receipt store is written only by treeproof");
     }
+    if c.contains(CONFIG_FILE) {
+        const WRITES: &[&str] = &[
+            ">",
+            "tee ",
+            "sed ",
+            "awk ",
+            "mv ",
+            "cp ",
+            "rm ",
+            "del ",
+            "truncate",
+            "dd ",
+            "perl",
+            "python",
+            "node ",
+            "ruby",
+            "git checkout",
+            "git restore",
+            "git apply",
+            "git stash",
+            "git mv",
+            "git rm",
+            "git reset",
+            "patch",
+            "install ",
+            "ln ",
+            "set-content",
+            "out-file",
+            "add-content",
+            "copy-item",
+            "move-item",
+            "remove-item",
+            "new-item",
+            "echo ",
+            "printf ",
+            "touch ",
+            "ed ",
+            "vi ",
+            "vim ",
+            "nano ",
+            "code ",
+        ];
+        if WRITES.iter().any(|k| c.contains(k)) {
+            return Some(POLICY_DENY);
+        }
+    }
     None
 }
+
+const POLICY_DENY: &str = "treeproof.toml is the repository's gate policy and is not for the agent to change (this session keeps the policy it started with either way); ask the user to edit it";
 
 fn pre_tool_use(input: &Value) -> Result<HookOutput> {
     let tool = str_field(input, "tool_name").unwrap_or("");
     if matches!(tool, "Bash" | "exec_command" | "shell") {
         if let Some(why) = bash_command(input).as_deref().and_then(forbidden_shell_command) {
-            return Ok(deny(format!("treeproof: {why}. Run tests with `treeproof run -- <command>` instead.")));
+            let hint = if why == POLICY_DENY { "" } else { " Run tests with `treeproof run -- <command>` instead." };
+            return Ok(deny(format!("treeproof: {why}.{hint}")));
+        }
+        // Record the session baseline before the agent's first command can change anything.
+        if let Ok(store) = Store::open() {
+            let _ = tool_context(input, &store);
         }
         return Ok(HookOutput::silent());
     }
@@ -371,11 +549,18 @@ fn pre_tool_use(input: &Value) -> Result<HookOutput> {
     let cwd = cwd_of(input);
     let paths = file_paths(input, &cwd);
     let store = Store::open()?;
+    let (root, state) = tool_context(input, &store);
     let protected: Vec<PathBuf> = [Some(store.root().to_path_buf()), crate::keys::key_path().ok()].into_iter().flatten().collect();
     if paths.iter().any(|p| protected.iter().any(|q| under(p, q))) {
         return Ok(deny("treeproof: the signing key and receipt store are written only by treeproof.".to_string()));
     }
-    if !fileguard_enabled(&cwd) {
+    if let Some(r) = &root {
+        let policy = r.join(CONFIG_FILE);
+        if paths.iter().any(|p| under(p, &policy)) {
+            return Ok(deny(format!("treeproof: {POLICY_DENY}.")));
+        }
+    }
+    if !fileguard_enabled(state.as_ref(), root.as_deref()) {
         return Ok(HookOutput::silent());
     }
     let stale = fileguard::stale(&store, &session_of(input), &paths);
@@ -426,4 +611,61 @@ pub fn main(event: Option<&str>) -> i32 {
         println!("{v}");
     }
     out.exit_code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observable_commands() {
+        for ok in [
+            "cargo test",
+            "cargo test --workspace -- --nocapture",
+            "cargo +nightly test",
+            "cargo nextest run",
+            "cd crates/x && cargo test",
+            "RUST_BACKTRACE=1 cargo test 2>&1",
+            "env CI=1 pytest -q",
+            "python -m pytest -q",
+            "python3 -u -m pytest",
+            "uv run pytest",
+            "npx jest --ci",
+            "npm test",
+            "npm run test",
+            "pnpm test",
+            "yarn jest",
+            "go test ./...",
+            "tox -e py312",
+        ] {
+            assert!(observable_test_command(ok), "{ok}");
+        }
+        for bad in [
+            "echo cargo test; printf 'test result: ok. 3 passed'",
+            "cargo test | tail -20",
+            "cargo test > out.txt",
+            "cargo test && echo done",
+            "cargo build",
+            "printf 'x' # cargo test",
+            "python -c \"print(1)\" pytest",
+            "python run_tests.py",
+            "cat log.txt",
+            "treeproof run -- cargo test",
+            "cd $(mktemp -d) && cargo test",
+            "cargo test $(echo --lib)",
+            "bash -c 'cargo test'",
+            "cargo test\necho ok",
+        ] {
+            assert!(!observable_test_command(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn policy_writes_are_forbidden() {
+        assert!(forbidden_shell_command("echo '[gate]' > treeproof.toml").is_some());
+        assert!(forbidden_shell_command("sed -i s/block/off/ treeproof.toml").is_some());
+        assert!(forbidden_shell_command("git checkout HEAD~1 -- treeproof.toml").is_some());
+        assert!(forbidden_shell_command("cat treeproof.toml").is_none());
+        assert!(forbidden_shell_command("git diff treeproof.toml").is_none());
+    }
 }

@@ -17,6 +17,24 @@ files=( ${TP_RECEIPTS} )
 report="${RUNNER_TEMP:-/tmp}/treeproof-report.json"
 echo "report=$report" >> "$GITHUB_OUTPUT"
 
+# Trusted keys and policy come from a revision the change cannot rewrite: the pull request's
+# base commit by default.
+trust="${TP_TRUST_REF:-}"
+if [ -z "$trust" ]; then
+  trust="${TP_BASE_SHA:-}"
+  [ -z "$trust" ] && trust="HEAD"
+fi
+if ! git cat-file -e "${trust}^{commit}" 2>/dev/null; then
+  git fetch --quiet --no-tags --depth=1 origin "$trust" 2>/dev/null || true
+fi
+if ! git cat-file -e "${trust}^{commit}" 2>/dev/null; then
+  echo "::error title=treeproof::trust-ref ${trust} is not available in the checkout; fetch it or set trust-ref."
+  echo "ok=false" >> "$GITHUB_OUTPUT"
+  exit 1
+fi
+echo "treeproof: trusted keys and policy from ${trust}"
+args+=(--keys-ref "$trust" --policy-ref "$trust")
+
 if [ ${#files[@]} -eq 0 ]; then
   echo "::error title=treeproof::no receipt files match ${TP_RECEIPTS}. Run \`treeproof export\` after a passing \`treeproof run\` and commit .treeproof/."
   echo "ok=false" >> "$GITHUB_OUTPUT"

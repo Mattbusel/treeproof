@@ -32,8 +32,12 @@ fn parse_seed(text: &str) -> Result<SigningKey> {
 
 /// Load the signing key if it exists.
 pub fn load() -> Result<Option<SigningKey>> {
-    let p = key_path()?;
-    match std::fs::read_to_string(&p) {
+    load_from(&key_path()?)
+}
+
+/// Load the signing key at `p` if it exists.
+pub fn load_from(p: &Path) -> Result<Option<SigningKey>> {
+    match std::fs::read_to_string(p) {
         Ok(t) => Ok(Some(parse_seed(&t)?)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(Error::new(format!("read {}: {e}", p.display()))),
@@ -42,11 +46,15 @@ pub fn load() -> Result<Option<SigningKey>> {
 
 /// Load the signing key, creating it on first use.
 pub fn load_or_create() -> Result<SigningKey> {
-    if let Some(k) = load()? {
+    load_or_create_at(&key_path()?)
+}
+
+/// Load the signing key at `p`, creating it on first use.
+pub fn load_or_create_at(p: &Path) -> Result<SigningKey> {
+    if let Some(k) = load_from(p)? {
         return Ok(k);
     }
-    let p = key_path()?;
-    create_at(&p)
+    create_at(p)
 }
 
 /// Create a fresh key at `p`. Fails if the file already exists.
@@ -112,6 +120,12 @@ pub fn trusted_keys(repo: Option<&Path>, include_local: bool, extra: &[PublicKey
             }
         }
     }
+    env_trusted_keys(&mut add)?;
+    Ok(out)
+}
+
+/// Keys listed in `TREEPROOF_TRUSTED_KEYS`.
+fn env_trusted_keys(add: &mut impl FnMut(PublicKey)) -> Result<()> {
     if let Some(list) = std::env::var_os("TREEPROOF_TRUSTED_KEYS") {
         for p in std::env::split_paths(&list) {
             if p.as_os_str().is_empty() {
@@ -121,5 +135,45 @@ pub fn trusted_keys(repo: Option<&Path>, include_local: bool, extra: &[PublicKey
             add(PublicKey::parse(&t).map_err(|e| Error::new(format!("{}: {e}", p.display())))?);
         }
     }
+    Ok(())
+}
+
+/// Directory, relative to the repository root, that holds the public keys a repository trusts.
+pub const TRUSTED_KEYS_DIR: &str = ".treeproof/trusted_keys";
+
+/// Public keys committed under `.treeproof/trusted_keys/` at commit `rev` (not the working copy).
+///
+/// CI uses this with the pull request's base commit, so a change cannot bring its own key.
+pub fn trusted_keys_at_rev(repo: &Path, rev: &str) -> Result<Vec<PublicKey>> {
+    let mut out: Vec<PublicKey> = Vec::new();
+    let mut names = crate::git::list_dir(repo, rev, TRUSTED_KEYS_DIR)?;
+    names.sort();
+    for path in names {
+        if !(path.ends_with(".pem") || path.ends_with(".pub")) {
+            continue;
+        }
+        if let Some(t) = crate::git::show_file(repo, rev, &path)? {
+            let k = PublicKey::parse(&t).map_err(|e| Error::new(format!("{rev}:{path}: {e}")))?;
+            if !out.contains(&k) {
+                out.push(k);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Keys the local gate trusts: this machine's signing key (from `ctx`) and `TREEPROOF_TRUSTED_KEYS`.
+/// Keys in the working copy are deliberately not included: an agent can write those.
+pub fn local_trusted_keys(ctx: &crate::Context) -> Result<Vec<PublicKey>> {
+    let mut out: Vec<PublicKey> = Vec::new();
+    let mut add = |k: PublicKey| {
+        if !out.contains(&k) {
+            out.push(k);
+        }
+    };
+    if let Some(sk) = ctx.existing_signing_key()? {
+        add(PublicKey { key: sk.verifying_key() });
+    }
+    env_trusted_keys(&mut add)?;
     Ok(out)
 }

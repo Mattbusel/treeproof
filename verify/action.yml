@@ -16,10 +16,16 @@ inputs:
     description: Only accept receipts whose subject is the checked-out tree, and require at least one.
     default: "true"
   keys:
-    description: Extra trusted public key files, one per line. Keys in .treeproof/trusted_keys/ are always trusted.
+    description: Extra trusted public key files, one per line, in addition to the keys committed at trust-ref.
+    default: ""
+  trust-ref:
+    description: >-
+      Git revision whose .treeproof/trusted_keys/ and treeproof.toml are trusted. Empty means the pull
+      request's base commit on pull_request events (so a change cannot bring its own key or policy),
+      and HEAD otherwise.
     default: ""
   version:
-    description: treeproof version to install (for example 0.1.0). Empty means the version in the action ref when it is a version tag, otherwise the latest release.
+    description: treeproof version to install (for example 0.1.1). Empty means the version in the action ref when it is a version tag, otherwise the latest release.
     default: ""
   install:
     description: "How to get treeproof: release (prebuilt binary), cargo (cargo install), or none (already on PATH)."
@@ -57,4 +63,6 @@ runs:
         TP_RERUN: ${{ inputs.rerun }}
         TP_CURRENT: ${{ inputs.require-current-tree }}
         TP_KEYS: ${{ inputs.keys }}
+        TP_TRUST_REF: ${{ inputs.trust-ref }}
+        TP_BASE_SHA: ${{ github.event.pull_request.base.sha }}
       run: bash "$GITHUB_ACTION_PATH/verify.sh"

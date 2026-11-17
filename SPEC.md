@@ -45,7 +45,7 @@ A receipt is one JSON object, the DSSE envelope:
 }
 ```
 
-- `subject` MUST contain exactly one descriptor with a `gitTree` digest (40 lowercase hex characters for SHA-1 repositories, 64 for SHA-256 repositories), computed as in section 4. Its `name` SHOULD be `worktree`.
+- `subject` MUST contain exactly one descriptor, and it MUST have a `gitTree` digest (40 lowercase hex characters for SHA-1 repositories, 64 for SHA-256 repositories), computed as in section 4. Its `name` SHOULD be `worktree`. Verifiers MUST reject a statement with any other number of subjects.
 - The predicate uses only the fields defined by test-result v0.1. treeproof-specific data lives in `configuration` descriptors (section 3), so a strict test-result parser accepts the predicate.
 - `passedTests`, `warnedTests` and `failedTests` hold test names when the runner printed them (for example `cargo test`, `pytest -v`, `go test -v`). They MAY be empty when the runner printed only totals; the counts in the run record are authoritative for the totals. Producers SHOULD cap each list (treeproof keeps at most 5000 names).
 
@@ -61,7 +61,7 @@ A producer MUST set `result` by these rules, in order:
 6. Some tests passed with a warning (pytest XPASS): `WARNED`.
 7. Otherwise: `PASSED`.
 
-A receipt that says `PASSED` therefore means: the command ran to completion with exit status 0, the runner reported at least one passing test, and no test failed.
+For a `fresh` receipt produced without the rule 4 exception, `PASSED` therefore means: the command ran to completion with exit status 0, the runner reported at least one passing test, and no test failed. Two kinds of `PASSED` receipt carry less: an `observed` receipt (section 3.4) may have `exitCode` null, because some hosts do not report it, and its output came from the agent's own shell; a rule 4 receipt has empty `runners` and zero counts and rests on the exit status alone. Gates treat both as not satisfying the policy unless it says otherwise (section 7).
 
 ## 3. Configuration descriptors
 
@@ -99,7 +99,7 @@ The annotations object. Unknown fields MUST be ignored by verifiers.
 | `durationMs` | int | Wall time. |
 | `headCommit` | string or null | `HEAD` at the time of the run, for orientation only. The subject, not this field, is what was tested. |
 | `toolchains` | object | Version strings for toolchains the command uses, for example `{"rustc": "rustc 1.91.0 (...)"}`. |
-| `env` | object | Allowlisted environment variable names mapped to the SHA-256 hex of their value, or null when unset. Values are never stored. |
+| `env` | object | Allowlisted environment variable names mapped to HMAC-SHA256 (hex) of their value under a per-machine secret key, or null when unset. Values are never stored, and without the secret a published value cannot be tested against guesses. Verifiers MUST NOT interpret these values; they only make the run key differ when a value differs. (Receipts from treeproof 0.1.0 hold an unkeyed SHA-256 here.) |
 | `os`, `arch` | string | Rust `std::env::consts::OS` / `ARCH` names. |
 | `notes` | array of string | Human-readable notes (filtered tests, timeouts, tree changed during the run). |
 | `reason` | string or null | Why the result is not `PASSED`, or a caveat. |
@@ -112,7 +112,11 @@ One descriptor per lockfile found at the repository root or in `cwd`, `{"name": 
 
 ### 3.4 Observed runs
 
-A host hook (for example Claude Code or Codex `PostToolUse`) MAY record a receipt from the output of a test command the agent ran itself. Such receipts MUST set `mode` to `observed`, `shell` to true, and `exitCode` to the exit status when the host reports one and null otherwise. Observed receipts are never cache entries. Policies decide whether they count (`accept_observed`).
+A host hook (for example Claude Code or Codex `PostToolUse`) MAY record a receipt from the output of a test command the agent ran itself. Such receipts MUST set `mode` to `observed`, `shell` to true, and `exitCode` to the exit status when the host reports one and null otherwise. Observed receipts are never cache entries. A producer SHOULD record observed runs only for a plain invocation of a known test runner, with nothing chained, piped, redirected or substituted, so the captured output is the runner's own. Policies decide whether observed passes count (`accept_observed`, default false).
+
+### 3.5 Nested-repository descriptors (optional)
+
+One descriptor per nested git repository in the working tree (an initialised submodule or an embedded repository), `{"name": "<path relative to root>", "digest": {"gitTree": "<working-tree digest of that repository>"}, "mediaType": "application/vnd.treeproof.nested-tree"}`, computed with section 4 inside the nested repository, recursively up to 4 levels. See 4.1.
 
 ## 4. Working-tree digest
 
@@ -131,6 +135,10 @@ Consequences:
 - Git's clean filters and end-of-line normalisation apply, so the same content checked out on Windows and Linux has the same digest.
 - Step 2 writes blob objects for new content into the object database. They are unreferenced and are removed by `git gc` in due course.
 
+### 4.1 Nested repositories
+
+`git add -A` stages a submodule or an embedded repository as a gitlink: the commit its `HEAD` points at. Uncommitted changes inside it do not change the digest. A producer SHOULD therefore record the working-tree digest of each nested repository as a configuration descriptor (3.5) and include them in the run key (section 5), and a gate MUST compare them with the current nested digests (section 7). An uninitialised submodule (no `.git` inside its directory) has no working tree and is skipped. Receipts without nested descriptors say nothing about nested content.
+
 ## 5. Run key
 
 The run key decides when a cached pass may be reused. It is SHA-256 (lowercase hex) of the compact JSON serialisation, with object keys sorted and no insignificant whitespace, of:
@@ -139,7 +147,7 @@ The run key decides when a cached pass may be reused. It is SHA-256 (lowercase h
 {"arch": ..., "argv": [...], "cwd": ..., "env": {...}, "lockfiles": {...}, "os": ..., "shell": ..., "toolchains": {...}, "tree": "<gitTree>", "v": 1}
 ```
 
-with the values defined in 3.2 and `lockfiles` mapping path to SHA-256. The default environment allowlist is `RUSTFLAGS RUSTDOCFLAGS CARGO_BUILD_TARGET CARGO_PROFILE PYTHONPATH PYTHONHASHSEED PYTEST_ADDOPTS NODE_ENV NODE_OPTIONS GOFLAGS GOOS GOARCH CGO_ENABLED GOEXPERIMENT`, extended per repository by `[run] env` in `treeproof.toml`.
+with the values defined in 3.2 and `lockfiles` mapping path to SHA-256. When the working tree contains nested repositories (4.1), the object also has a `"nested"` member mapping each path to its working-tree digest; it is omitted otherwise. The default environment allowlist is `RUSTFLAGS RUSTDOCFLAGS CARGO_BUILD_TARGET CARGO_PROFILE PYTHONPATH PYTHONHASHSEED PYTEST_ADDOPTS NODE_ENV NODE_OPTIONS GOFLAGS GOOS GOARCH CGO_ENABLED GOEXPERIMENT`, extended per repository by `[run] env` in `treeproof.toml`.
 
 The run key is a cache index, not a security property. Verifiers MUST NOT recompute it to decide trust; they check the signature and the subject.
 
@@ -160,18 +168,24 @@ To verify a receipt against a set of trusted Ed25519 public keys:
 A **gate** (a host hook, an orchestrator, CI) is satisfied for a tree when it holds at least one receipt that:
 
 - verifies (section 6) against its trusted keys,
-- has the current tree as subject,
+- has the current tree as subject, and nested-repository descriptors (3.5) equal to the current nested digests,
 - has `result` `PASSED` or `WARNED`,
+- has at least one recognised runner, unless the policy allows unrecognised output,
 - has `counts.passed` at least the policy minimum (default 1),
 - if the policy lists required commands, has a matching command,
-- if the policy refuses observed receipts, has `mode` `fresh`.
+- has `mode` `fresh`, unless the policy accepts observed receipts (default: it does not),
+- did not select a subset of the tests, unless the policy allows subsets or the command matches a required command exactly (treeproof's detection is described in `docs/configuration.md`),
 
-"Fresh" means "for the current tree". Any change to a tracked or untracked non-ignored file changes the tree and invalidates every earlier receipt for gating purposes.
+and no receipt for the same tree records failing tests for a command (failed tests, or a non-zero exit with a recognised runner) without a later passing receipt of the same command.
+
+"Fresh" means "for the current tree". Any change to a tracked or untracked non-ignored file, or inside a nested repository, changes the tree or its nested digests and invalidates every earlier receipt for gating purposes.
+
+The policy and the trusted keys MUST come from a source the party being checked cannot write. For a coding agent that is not the working copy: treeproof's hooks use the policy committed when the session started and trust only the local signing key; CI uses the keys and policy of the pull request's base commit.
 
 ## 8. Keys
 
 - Public keys are distributed as PEM `PUBLIC KEY` (SubjectPublicKeyInfo, RFC 8410), the format OpenSSL and cosign use. Hex or base64 of the 32 raw bytes is also accepted by treeproof.
-- A repository that wants CI to verify receipts commits the public keys it trusts under `.treeproof/trusted_keys/*.pem`.
+- A repository that wants CI to verify receipts commits the public keys it trusts under `.treeproof/trusted_keys/*.pem`. CI reads them from the base commit of a change, never from the change itself.
 - The private key never appears in a receipt or in the repository.
 
 ## 9. Example

@@ -50,6 +50,20 @@ enum Cmd {
         /// Do not trust this machine's own signing key.
         #[arg(long)]
         no_local_key: bool,
+        /// Trust the keys committed under .treeproof/trusted_keys/ at this git revision (for
+        /// example a pull request's base commit) instead of the keys in the working copy.
+        #[arg(long, value_name = "REV")]
+        keys_ref: Option<String>,
+        /// Do not trust keys from .treeproof/trusted_keys/ in the working copy.
+        #[arg(long)]
+        no_repo_keys: bool,
+        /// Apply the gate policy (treeproof.toml) committed at this revision: required commands,
+        /// minimum tests, observed and subset runs. Defaults to HEAD when --tree current is given.
+        #[arg(long, value_name = "REV")]
+        policy_ref: Option<String>,
+        /// Do not apply a gate policy.
+        #[arg(long, conflicts_with = "policy_ref")]
+        no_policy: bool,
         /// Only consider receipts for this tree: a git tree id, or `current`.
         /// Receipts for other trees are skipped; at least one must match.
         #[arg(long)]
@@ -65,11 +79,17 @@ enum Cmd {
     Status {
         #[arg(long)]
         json: bool,
+        /// Read treeproof.toml as committed at this revision (default HEAD; the working copy is never used).
+        #[arg(long, value_name = "REV")]
+        policy_ref: Option<String>,
     },
     /// Exit 0 when a valid passing receipt for the current tree satisfies the policy, 1 otherwise.
     Gate {
         #[arg(long)]
         json: bool,
+        /// Read treeproof.toml as committed at this revision (default HEAD; the working copy is never used).
+        #[arg(long, value_name = "REV")]
+        policy_ref: Option<String>,
     },
     /// Print the working-tree digest (git tree id) receipts are bound to.
     Tree,
@@ -80,6 +100,9 @@ enum Cmd {
         /// Keep receipts for older trees in the directory.
         #[arg(long)]
         keep_old: bool,
+        /// Read treeproof.toml as committed at this revision (default HEAD).
+        #[arg(long, value_name = "REV")]
+        policy_ref: Option<String>,
     },
     /// Manage the signing key.
     Key {
@@ -181,44 +204,103 @@ fn read_keys(paths: &[PathBuf]) -> Result<Vec<PublicKey>> {
         .collect()
 }
 
+/// The policy for gate/status/export: committed at `policy_ref`, or at HEAD.
+fn load_policy(root: &std::path::Path, policy_ref: Option<&str>) -> Result<(Config, String)> {
+    match policy_ref {
+        Some(r) => Ok((Config::load_at_rev(root, r)?.0, format!("{r}:treeproof.toml"))),
+        None => Ok((Config::load_committed(root)?, "HEAD:treeproof.toml".to_string())),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cmd_verify(
     files: Vec<PathBuf>,
     key_files: Vec<PathBuf>,
     no_local_key: bool,
+    keys_ref: Option<String>,
+    no_repo_keys: bool,
+    policy_ref: Option<String>,
+    no_policy: bool,
     tree: Option<String>,
     rerun: bool,
     json: bool,
 ) -> Result<ExitCode> {
     let root = git::repo_root(&cwd()).ok();
-    let extra = read_keys(&key_files)?;
-    let trusted = keys::trusted_keys(root.as_deref(), !no_local_key, &extra)?;
+    let need_root = |what: &str| root.clone().ok_or_else(|| Error::new(format!("{what} needs a git repository")));
+    let mut extra = read_keys(&key_files)?;
+    let repo_keys_dir = if let Some(r) = &keys_ref {
+        let rr = need_root("--keys-ref")?;
+        extra.extend(keys::trusted_keys_at_rev(&rr, r)?);
+        None
+    } else if no_repo_keys {
+        None
+    } else {
+        root.clone()
+    };
+    let trusted = keys::trusted_keys(repo_keys_dir.as_deref(), !no_local_key, &extra)?;
+    if trusted.is_empty() {
+        let where_ = keys_ref.as_deref().map(|r| format!(" at {r}")).unwrap_or_default();
+        return Err(Error::new(format!(
+            "no trusted keys: none committed under .treeproof/trusted_keys/{where_} and none given with --key. Commit the signer's public key (treeproof key export) to the base branch first."
+        )));
+    }
+    let current = tree.as_deref() == Some("current");
     let want = match tree.as_deref() {
-        Some("current") => Some(git::tree_digest(root.as_deref().ok_or_else(|| Error::new("--tree current needs a git repository"))?)?),
+        Some("current") => Some(git::tree_digest(&need_root("--tree current")?)?),
         Some(t) if treeproof::util::is_git_oid(t) => Some(t.to_string()),
         Some(t) => return Err(Error::new(format!("--tree must be a git tree id or `current`, not {t:?}"))),
         None => None,
     };
-    let rerun_root = if rerun { Some(root.clone().ok_or_else(|| Error::new("--rerun needs a git repository"))?) } else { None };
+    let policy_rev = if no_policy { None } else { policy_ref.or_else(|| current.then(|| "HEAD".to_string())) };
+    let policy = match &policy_rev {
+        Some(r) => {
+            let rr = need_root("--policy-ref")?;
+            let cfg = if r == "HEAD" { Config::load_committed(&rr)? } else { Config::load_at_rev(&rr, r)?.0 };
+            Some(cfg)
+        }
+        None => None,
+    };
+    let nested_now = if current { Some(git::nested_trees(&need_root("--tree current")?)?) } else { None };
+    let rerun_root = if rerun { Some(need_root("--rerun")?) } else { None };
     let mut reports = Vec::new();
     let mut skipped = Vec::new();
     for f in &files {
         let text = std::fs::read_to_string(f).map_err(|e| Error::new(format!("read {}: {e}", f.display())))?;
-        // With --tree, look at the subject first and skip receipts for other trees without re-running them.
-        let rep = if let Some(w) = &want {
-            let pre = verify::verify_text(&f.display().to_string(), &text, &trusted, None, None, false);
+        let src = f.display().to_string();
+        // Check the signature, subject and policy first: receipts for other trees are skipped and
+        // nothing is re-run unless everything else holds.
+        let mut pre = verify::verify_text(&src, &text, &trusted, None, None, false);
+        if let Some(w) = &want {
             if pre.signature_ok && pre.tree.as_deref() != Some(w.as_str()) {
-                skipped.push(f.display().to_string());
+                skipped.push(src);
                 continue;
             }
-            if !pre.signature_ok {
-                pre
-            } else {
-                verify::verify_text(&f.display().to_string(), &text, &trusted, Some(w), rerun_root.as_deref(), !json)
+        }
+        if !pre.ok {
+            reports.push(pre);
+            continue;
+        }
+        let r = receipt::open_text(&text, &trusted)?;
+        let mut problems = Vec::new();
+        if let (Some(cfg), Some(rev)) = (&policy, &policy_rev) {
+            if let Some(why) = gate::policy_rejection(&r, cfg) {
+                problems.push(format!("policy {rev}:treeproof.toml: {why}"));
             }
-        } else {
-            verify::verify_text(&f.display().to_string(), &text, &trusted, None, rerun_root.as_deref(), !json)
-        };
-        reports.push(rep);
+        }
+        if let Some(n) = &nested_now {
+            if r.nested_trees() != *n {
+                problems.push(
+                    "nested repository (submodule) content differs from the receipt; check out submodules before verifying".to_string(),
+                );
+            }
+        }
+        if !problems.is_empty() {
+            pre.ok = false;
+            pre.errors.extend(problems);
+            reports.push(pre);
+            continue;
+        }
+        reports.push(verify::verify_text(&src, &text, &trusted, want.as_deref(), rerun_root.as_deref(), !json));
     }
     let mut ok = !reports.is_empty() && reports.iter().all(|r| r.ok);
     let mut problems = Vec::new();
@@ -232,7 +314,7 @@ fn cmd_verify(
         println!(
             "{}",
             serde_json::to_string_pretty(
-                &serde_json::json!({"ok": ok, "reports": reports, "skipped_other_trees": skipped, "problems": problems})
+                &serde_json::json!({"ok": ok, "reports": reports, "skipped_other_trees": skipped, "problems": problems, "policy": policy_rev.as_ref().map(|r| format!("{r}:treeproof.toml"))})
             )?
         );
     } else {
@@ -265,9 +347,9 @@ fn cmd_verify(
     Ok(if ok { ExitCode::SUCCESS } else { ExitCode::from(1) })
 }
 
-fn cmd_status(json: bool, gate_only: bool) -> Result<ExitCode> {
+fn cmd_status(json: bool, gate_only: bool, policy_ref: Option<String>) -> Result<ExitCode> {
     let root = git::repo_root(&cwd())?;
-    let cfg = Config::load(&root)?;
+    let (cfg, source) = load_policy(&root, policy_ref.as_deref())?;
     let rep = gate::evaluate(&root, &cfg, None)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&rep)?);
@@ -277,6 +359,12 @@ fn cmd_status(json: bool, gate_only: bool) -> Result<ExitCode> {
         println!("tree     {}", rep.tree);
         println!("gate     {}", if rep.ok { "PASS" } else { "BLOCK" });
         println!("verdict  {}", rep.reason);
+        println!("policy   {source}");
+        if let Ok(wc) = Config::load(&root) {
+            if wc != cfg {
+                println!("note     the working copy's treeproof.toml differs from {source}; policy changes apply once committed");
+            }
+        }
         for b in &rep.considered {
             println!(
                 "receipt  {:7} {:8} {} passed  `{}`  {}{}",
@@ -292,9 +380,9 @@ fn cmd_status(json: bool, gate_only: bool) -> Result<ExitCode> {
     Ok(if rep.ok { ExitCode::SUCCESS } else { ExitCode::from(1) })
 }
 
-fn cmd_export(dir: PathBuf, keep_old: bool) -> Result<ExitCode> {
+fn cmd_export(dir: PathBuf, keep_old: bool, policy_ref: Option<String>) -> Result<ExitCode> {
     let root = git::repo_root(&cwd())?;
-    let cfg = Config::load(&root)?;
+    let (cfg, _) = load_policy(&root, policy_ref.as_deref())?;
     let rep = gate::evaluate(&root, &cfg, None)?;
     let Some(chosen) = rep.receipt else {
         eprintln!("treeproof: {}", rep.reason);
@@ -447,14 +535,16 @@ fn main() -> ExitCode {
         Cmd::Run { no_cache, shell, allow_unrecognized, timeout, json, command } => {
             cmd_run(command, shell, no_cache, allow_unrecognized, timeout, json)
         }
-        Cmd::Verify { files, keys, no_local_key, tree, rerun, json } => cmd_verify(files, keys, no_local_key, tree, rerun, json),
-        Cmd::Status { json } => cmd_status(json, false),
-        Cmd::Gate { json } => cmd_status(json, true),
+        Cmd::Verify { files, keys, no_local_key, keys_ref, no_repo_keys, policy_ref, no_policy, tree, rerun, json } => {
+            cmd_verify(files, keys, no_local_key, keys_ref, no_repo_keys, policy_ref, no_policy, tree, rerun, json)
+        }
+        Cmd::Status { json, policy_ref } => cmd_status(json, false, policy_ref),
+        Cmd::Gate { json, policy_ref } => cmd_status(json, true, policy_ref),
         Cmd::Tree => git::repo_root(&cwd()).and_then(|r| git::tree_digest(&r)).map(|t| {
             println!("{t}");
             ExitCode::SUCCESS
         }),
-        Cmd::Export { dir, keep_old } => cmd_export(dir, keep_old),
+        Cmd::Export { dir, keep_old, policy_ref } => cmd_export(dir, keep_old, policy_ref),
         Cmd::Key { action } => cmd_key(action),
         Cmd::Hook { event } => return ExitCode::from(hooks::main(event.as_deref()).clamp(0, 255) as u8),
         Cmd::Mcp => return ExitCode::from(mcp::serve() as u8),

@@ -35,6 +35,25 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex(&Sha256::digest(data))
 }
 
+/// HMAC-SHA256 (RFC 2104) of `data` under `key`, as lowercase hex.
+pub fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
+    const BLOCK: usize = 64;
+    let mut k = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        k[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Sha256::new();
+    inner.update(k.map(|b| b ^ 0x36));
+    inner.update(data);
+    let ih = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(k.map(|b| b ^ 0x5c));
+    outer.update(ih);
+    hex(&outer.finalize())
+}
+
 /// True for a 40 (SHA-1) or 64 (SHA-256) character lowercase hex git object id.
 pub fn is_git_oid(s: &str) -> bool {
     (s.len() == 40 || s.len() == 64) && s.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
@@ -180,5 +199,24 @@ mod tests {
         assert!(is_git_oid("4b825dc642cb6eb9a060e54bf8d69288fbee4904"));
         assert!(!is_git_oid("4B825DC642CB6EB9A060E54BF8D69288FBEE4904"));
         assert!(!is_git_oid("abc"));
+    }
+}
+
+#[cfg(test)]
+mod hmac_tests {
+    use super::*;
+
+    #[test]
+    fn rfc4231_case_1_and_2() {
+        assert_eq!(hmac_sha256_hex(&[0x0b; 20], b"Hi There"), "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+        assert_eq!(
+            hmac_sha256_hex(b"Jefe", b"what do ya want for nothing?"),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        // Keys longer than a block are hashed first (RFC 4231 case 6).
+        assert_eq!(
+            hmac_sha256_hex(&[0xaa; 131], b"Test Using Larger Than Block-Size Key - Hash Key First"),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
     }
 }

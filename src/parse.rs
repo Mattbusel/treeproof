@@ -203,13 +203,13 @@ fn parse_pytest(text: &str, s: &mut Summary) {
     let vline = re(&VLINE, r"^(\S+::\S.*?) (PASSED|FAILED|SKIPPED|XFAIL|XPASS|ERROR)(?:\s|$)");
     let xline = re(&XLINE, r"^\[gw\d+\] \[\s*\d+%\] (PASSED|FAILED|SKIPPED|XFAIL|XPASS|ERROR) (\S+::\S.*)$");
     let short = re(&SHORT, r"^(FAILED|ERROR) (\S+::\S+?)(?: - .*)?$");
-    let mut last: Option<(u64, u64, u64, u64, bool)> = None;
+    let mut last: Option<(u64, u64, u64, u64, bool, u64)> = None;
     let (mut pn, mut fnames, mut wn) = (Vec::new(), Vec::new(), Vec::new());
     for l in text.lines() {
         let t = l.trim();
         if let Some(c) = fin.captures(t) {
             let body = c.get(1).map(|m| m.as_str()).unwrap_or("");
-            let (mut p, mut f, mut sk, mut w) = (0, 0, 0, 0);
+            let (mut p, mut f, mut sk, mut w, mut d) = (0, 0, 0, 0, 0);
             for ic in item.captures_iter(body) {
                 let n = num(ic.get(1));
                 match ic.get(2).map(|m| m.as_str()).unwrap_or("") {
@@ -217,10 +217,11 @@ fn parse_pytest(text: &str, s: &mut Summary) {
                     "failed" | "error" | "errors" => f += n,
                     "skipped" | "xfailed" => sk += n,
                     "xpassed" => w += n,
+                    "deselected" => d += n,
                     _ => {}
                 }
             }
-            last = Some((p, f, sk, w, body == "no tests ran"));
+            last = Some((p, f, sk, w, body == "no tests ran", d));
             continue;
         }
         let (status, name) = if let Some(c) = xline.captures(t) {
@@ -239,7 +240,7 @@ fn parse_pytest(text: &str, s: &mut Summary) {
             _ => {}
         }
     }
-    if let Some((p, f, sk, w, none)) = last {
+    if let Some((p, f, sk, w, none, desel)) = last {
         s.add_runner(Runner::Pytest);
         s.passed += p;
         s.failed += f;
@@ -250,6 +251,9 @@ fn parse_pytest(text: &str, s: &mut Summary) {
         s.warned_names.extend(wn);
         if none {
             s.notes.push("pytest: no tests ran".into());
+        }
+        if desel > 0 {
+            s.notes.push(format!("pytest: {desel} deselected"));
         }
     }
 }
@@ -291,6 +295,13 @@ fn parse_jest(text: &str, s: &mut Summary) {
     } else if text.lines().any(|l| l.trim_start().starts_with("No tests found, exiting with code")) {
         s.add_runner(Runner::Jest);
         s.notes.push("jest: no tests found".into());
+    }
+    // "Ran all test suites." is a full run; "Ran all test suites matching /x/i." or
+    // "... related to changed files" or "... with tests matching" is a selection.
+    if last.is_some() {
+        if let Some(l) = text.lines().map(str::trim).find(|l| l.starts_with("Ran all test suites") && *l != "Ran all test suites.") {
+            s.notes.push(format!("jest: selected a subset ({})", l.chars().take(160).collect::<String>()));
+        }
     }
 }
 
@@ -442,6 +453,140 @@ fn looks_like_go_duration(t: &str) -> bool {
     first == "(cached)" || (first.ends_with('s') && first.trim_end_matches('s').parse::<f64>().is_ok())
 }
 
+/// Words of a command for argument inspection: argv as given, or a shell line split on
+/// whitespace with surrounding quotes removed.
+pub fn command_words(argv: &[String], shell: bool) -> Vec<String> {
+    if shell {
+        argv.join(" ").split_whitespace().map(|w| w.trim_matches(|c| c == '"' || c == '\'').to_string()).collect()
+    } else {
+        argv.to_vec()
+    }
+}
+
+/// Lower-case program name without directory or Windows executable extension.
+pub fn prog_name(w: &str) -> String {
+    let base = w.rsplit(['/', '\\']).next().unwrap_or(w).to_ascii_lowercase();
+    base.trim_end_matches(".exe").trim_end_matches(".cmd").trim_end_matches(".bat").to_string()
+}
+
+/// Does this run select a subset of the tests by name or file? Returns what gave it away.
+///
+/// Detected from the output (`cargo test` "N filtered out", pytest "N deselected", jest
+/// "Ran all test suites matching ...") and from the arguments (pytest `-k`, `-m`, `--lf`,
+/// `--deselect`, node ids and single files; `go test -run`/`-skip`; jest/vitest `-t`,
+/// `--testNamePattern`, `--onlyChanged`, `--changed`, `--shard`, `related`, and file
+/// filters; nextest filter expressions, `--partition` and name filters). Package or target
+/// selection (`cargo test -p x`, `go test ./pkg/...`) is not treated as a subset.
+pub fn subset_reason(words: &[String], notes: &[String]) -> Option<String> {
+    for n in notes {
+        let filtered = n.starts_with("cargo: ") && n.ends_with(" tests filtered out");
+        let desel = n.starts_with("pytest: ") && n.ends_with(" deselected");
+        if filtered || desel || n.starts_with("jest: selected a subset") {
+            return Some(n.clone());
+        }
+    }
+    let names: Vec<String> = words.iter().map(|w| prog_name(w)).collect();
+    let found = |prog: &str| names.iter().position(|n| n == prog);
+    let flag_in = |args: &[String], flags: &[&str]| -> Option<String> {
+        args.iter().find(|a| flags.iter().any(|f| a.as_str() == *f || (f.starts_with("--") && a.starts_with(&format!("{f}="))))).cloned()
+    };
+    // A bare word following the runner (or a subcommand) rather than a flag's value.
+    let positional = |args: &[String], skip: &[&str], pred: &dyn Fn(&str) -> bool| -> Option<String> {
+        let mut prev_flag = false;
+        for a in args {
+            if a == "--" {
+                break;
+            }
+            if a.starts_with('-') {
+                prev_flag = !a.contains('=');
+                continue;
+            }
+            if !prev_flag && !skip.contains(&a.as_str()) && pred(a) {
+                return Some(a.clone());
+            }
+            prev_flag = false;
+        }
+        None
+    };
+    // pytest (also `python -m pytest`)
+    if let Some(i) = found("pytest").or_else(|| found("py.test")) {
+        let args = &words[i + 1..];
+        if let Some(a) = args.iter().find(|a| a.contains("::")) {
+            return Some(format!("pytest node id {a}"));
+        }
+        if let Some(f) = flag_in(args, &["-k", "-m", "--lf", "--last-failed", "--deselect", "--sw", "--stepwise"]) {
+            return Some(format!("pytest {f}"));
+        }
+        if let Some(a) = args.iter().find(|a| (a.starts_with("-k") || a.starts_with("-m")) && a.len() > 2 && !a.starts_with("--")) {
+            return Some(format!("pytest {a}"));
+        }
+        if let Some(p) = positional(args, &[], &|a: &str| a.ends_with(".py")) {
+            return Some(format!("pytest file {p}"));
+        }
+    }
+    // go test
+    if let Some(i) = found("go") {
+        if words.get(i + 1).map(|w| w.as_str()) == Some("test") {
+            if let Some(f) = words[i + 2..].iter().find(|a| {
+                let a = a.trim_start_matches('-');
+                a == "run" || a == "skip" || a.starts_with("run=") || a.starts_with("skip=")
+            }) {
+                return Some(format!("go test {f}"));
+            }
+        }
+    }
+    // jest / vitest
+    for prog in ["jest", "vitest"] {
+        if let Some(i) = found(prog) {
+            let args = &words[i + 1..];
+            let flags = [
+                "-t",
+                "--testNamePattern",
+                "--testPathPattern",
+                "--testPathPatterns",
+                "-o",
+                "--onlyChanged",
+                "--changed",
+                "--changedSince",
+                "--findRelatedTests",
+                "--onlyFailures",
+                "-f",
+                "--shard",
+                "--project",
+            ];
+            if let Some(f) = flag_in(args, &flags) {
+                return Some(format!("{prog} {f}"));
+            }
+            if prog == "vitest" && args.first().map(|a| a.as_str()) == Some("related") {
+                return Some("vitest related".to_string());
+            }
+            if let Some(p) = positional(args, &["run", "watch", "dev"], &|_| true) {
+                return Some(format!("{prog} file filter {p}"));
+            }
+        }
+    }
+    // cargo nextest run
+    if let Some(i) = found("nextest").or_else(|| found("cargo-nextest")) {
+        let args = &words[i + 1..];
+        if let Some(f) = flag_in(args, &["-E", "--filterset", "--filter-expr", "--partition"]) {
+            return Some(format!("nextest {f}"));
+        }
+        if let Some(p) = positional(args, &["run", "r"], &|_| true) {
+            return Some(format!("nextest name filter {p}"));
+        }
+        if let Some(j) = args.iter().position(|a| a == "--") {
+            if let Some(p) = args[j + 1..].iter().find(|a| !a.starts_with('-')) {
+                return Some(format!("nextest name filter {p}"));
+            }
+        }
+    }
+    // cargo test: name filters show up as "filtered out" in the output; --ignored runs only ignored tests.
+    if found("cargo").is_some() && words.iter().any(|w| w == "--ignored") {
+        return Some("libtest --ignored".to_string());
+    }
+    None
+}
+
 /// Detect invocations that list or collect tests without running them.
 pub fn is_collect_only(argv: &[String]) -> Option<&'static str> {
     let has = |f: &str| argv.iter().any(|a| a == f);
@@ -473,6 +618,56 @@ pub fn is_collect_only(argv: &[String]) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subsets() {
+        let w = |s: &str| command_words(&[s.to_string()], true);
+        let none: Vec<String> = Vec::new();
+        for full in [
+            "cargo test",
+            "cargo test --workspace -p foo",
+            "python -m pytest -q",
+            "pytest tests/",
+            "pytest -x -q --maxfail 3",
+            "go test ./...",
+            "go test -v -count=1 ./pkg/...",
+            "npx jest",
+            "npx jest --ci --coverage",
+            "npx vitest run",
+            "cargo nextest run --workspace",
+            "cargo nextest run -p foo --profile ci",
+            "npm test",
+        ] {
+            assert_eq!(subset_reason(&w(full), &none), None, "{full}");
+        }
+        for sub in [
+            "python -m pytest -q test_a.py::test_a",
+            "pytest -k slow",
+            "pytest -kslow",
+            "pytest -m 'not slow'",
+            "pytest --lf",
+            "pytest test_a.py",
+            "go test -run TestX ./...",
+            "go test -run=TestX ./...",
+            "npx jest -t adds",
+            "npx jest src/math",
+            "npx vitest run src/math",
+            "npx vitest related src/a.ts",
+            "cargo nextest run adds",
+            "cargo nextest run -E test(adds)",
+            "cargo test -- --ignored",
+        ] {
+            assert!(subset_reason(&w(sub), &none).is_some(), "{sub}");
+        }
+        assert!(subset_reason(&w("cargo test"), &["cargo: 12 tests filtered out".into()]).is_some());
+        assert!(subset_reason(&w("pytest"), &["pytest: 2 deselected".into()]).is_some());
+        let s = parse("Tests:       3 passed, 3 total\nRan all test suites matching /math/i.\n", &[]);
+        assert!(subset_reason(&[], &s.notes).is_some());
+        let s = parse("Tests:       3 passed, 3 total\nRan all test suites.\n", &[]);
+        assert!(subset_reason(&[], &s.notes).is_none());
+        let s = parse("===== 3 passed, 2 deselected in 0.02s =====\n", &[]);
+        assert!(subset_reason(&[], &s.notes).is_some());
+    }
 
     fn argv(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()

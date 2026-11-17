@@ -1,13 +1,14 @@
 //! `treeproof run`: execute a test command once per identical input, sign the result.
 
 use crate::config::Config;
+use crate::context::Context;
 use crate::dsse::PublicKey;
 use crate::fingerprint::{self, Fingerprint};
 use crate::parse::{self, Summary};
 use crate::receipt::{self, Counts, RunInfo, MODE_FRESH, MODE_OBSERVED};
 use crate::store::Store;
 use crate::util::{now_ms, rfc3339_ms, tail};
-use crate::{keys, Error, Result};
+use crate::{Error, Result};
 use ed25519_dalek::SigningKey;
 use serde::Serialize;
 use std::io::{Read, Write};
@@ -21,6 +22,8 @@ pub const MAX_CAPTURE: usize = 32 * 1024 * 1024;
 /// Output tail stored with a cached pass and replayed on a hit.
 pub const MAX_LOG: usize = 256 * 1024;
 
+/// Options for [`run`]. Build one with [`RunOptions::new`] and the `with_*` methods so
+/// new options in later versions do not break your code.
 #[derive(Clone, Debug)]
 pub struct RunOptions {
     pub argv: Vec<String>,
@@ -32,6 +35,74 @@ pub struct RunOptions {
     pub echo: bool,
     pub allow_unrecognized: Option<bool>,
     pub timeout: Option<Duration>,
+}
+
+impl RunOptions {
+    /// Run `argv` (program and arguments, no shell) in `cwd`, with the cache on, output
+    /// captured rather than echoed, policy defaults, and no timeout.
+    pub fn new(argv: Vec<String>, cwd: impl Into<PathBuf>) -> RunOptions {
+        RunOptions { argv, shell: false, cwd: cwd.into(), no_cache: false, echo: false, allow_unrecognized: None, timeout: None }
+    }
+
+    /// Run one command line through the platform shell (`sh -c` / `cmd /C`).
+    pub fn shell_line(line: impl Into<String>, cwd: impl Into<PathBuf>) -> RunOptions {
+        RunOptions { shell: true, ..RunOptions::new(vec![line.into()], cwd) }
+    }
+
+    pub fn with_no_cache(mut self, v: bool) -> RunOptions {
+        self.no_cache = v;
+        self
+    }
+
+    pub fn with_echo(mut self, v: bool) -> RunOptions {
+        self.echo = v;
+        self
+    }
+
+    pub fn with_timeout(mut self, t: Option<Duration>) -> RunOptions {
+        self.timeout = t;
+        self
+    }
+
+    pub fn with_allow_unrecognized(mut self, v: Option<bool>) -> RunOptions {
+        self.allow_unrecognized = v;
+        self
+    }
+}
+
+/// The in-toto result of a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum TestResult {
+    Passed,
+    Warned,
+    Failed,
+}
+
+impl TestResult {
+    pub fn parse(s: &str) -> Option<TestResult> {
+        match s {
+            "PASSED" => Some(TestResult::Passed),
+            "WARNED" => Some(TestResult::Warned),
+            "FAILED" => Some(TestResult::Failed),
+            _ => None,
+        }
+    }
+
+    /// `PASSED` or `WARNED`.
+    pub fn is_pass(self) -> bool {
+        !matches!(self, TestResult::Failed)
+    }
+}
+
+/// How a run's receipt was obtained.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum RunStatus {
+    /// The command was executed.
+    Fresh,
+    /// An identical passing run was served from the store.
+    CacheHit,
+    /// Recorded from a host's own tool output.
+    Observed,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -52,6 +123,27 @@ pub struct RunOutcome {
     pub receipt_json: String,
     #[serde(skip)]
     pub output: String,
+}
+
+impl RunOutcome {
+    /// The result as an enum (`result` holds the same value as a string).
+    pub fn test_result(&self) -> TestResult {
+        TestResult::parse(&self.result).unwrap_or(TestResult::Failed)
+    }
+
+    /// The status as an enum (`status` holds the same value as a string).
+    pub fn run_status(&self) -> RunStatus {
+        match self.status.as_str() {
+            "cache_hit" => RunStatus::CacheHit,
+            "observed" => RunStatus::Observed,
+            _ => RunStatus::Fresh,
+        }
+    }
+
+    /// True for `PASSED` or `WARNED`.
+    pub fn passed(&self) -> bool {
+        self.test_result().is_pass()
+    }
 }
 
 /// Resolve a bare program name the way a shell would, including `PATHEXT` on Windows,
@@ -221,6 +313,7 @@ pub fn decide(
 fn sign_run(
     sk: &SigningKey,
     fp: &Fingerprint,
+    nested: &std::collections::BTreeMap<String, String>,
     root: &Path,
     argv: &[String],
     shell: bool,
@@ -256,7 +349,7 @@ fn sign_run(
         host,
         treeproof_version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    let st = receipt::build_statement(&fp.tree, result, &run, &fp.lockfiles, summary)?;
+    let st = receipt::build_statement_with_nested(&fp.tree, result, &run, &fp.lockfiles, nested, summary)?;
     let env = receipt::sign_statement(sk, &st)?;
     Ok(serde_json::to_string(&env)? + "\n")
 }
@@ -279,14 +372,36 @@ fn outcome_from_receipt(status: &str, r: &receipt::Receipt, json: String, path: 
     }
 }
 
-/// Run a command under treeproof (see the crate docs).
+/// Environment allowlist and `allow_unrecognized` for a run. `allow_unrecognized` comes from
+/// the committed policy only (an agent can write the working copy); extra environment names
+/// from either file are added to the key, which can only make the cache stricter.
+fn run_policy(root: &Path) -> Result<(Vec<String>, bool)> {
+    let committed = Config::load_committed(root)?;
+    let mut env = committed.run.env.clone();
+    if let Ok(wc) = Config::load(root) {
+        for e in wc.run.env {
+            if !env.contains(&e) {
+                env.push(e);
+            }
+        }
+    }
+    Ok((env, committed.run.allow_unrecognized))
+}
+
+/// Run a command under treeproof (see the crate docs), with the default store and key.
 pub fn run(opts: &RunOptions) -> Result<RunOutcome> {
+    run_in(opts, &Context::default())
+}
+
+/// Run a command under treeproof with the store and key from `ctx`.
+pub fn run_in(opts: &RunOptions, ctx: &Context) -> Result<RunOutcome> {
     let root = crate::git::repo_root(&opts.cwd)?;
-    let cfg = Config::load(&root)?;
-    let sk = keys::load_or_create()?;
+    let (env_names, policy_allow) = run_policy(&root)?;
+    let sk = ctx.signing_key()?;
     let pk = PublicKey { key: sk.verifying_key() };
-    let store = Store::open()?;
-    let fp = fingerprint::compute(&root, &opts.cwd, &opts.argv, opts.shell, &cfg.run.env)?;
+    let store = ctx.open_store()?;
+    let salt = store.env_salt()?;
+    let (fp, nested) = fingerprint::compute_full(&root, &opts.cwd, &opts.argv, opts.shell, &env_names, &salt)?;
 
     let try_cache = |store: &Store| -> Option<RunOutcome> {
         if opts.no_cache {
@@ -327,7 +442,7 @@ pub fn run(opts: &RunOptions) -> Result<RunOutcome> {
     if timed_out {
         summary.notes.push("timed out and was killed".into());
     }
-    let allow = opts.allow_unrecognized.unwrap_or(cfg.run.allow_unrecognized);
+    let allow = opts.allow_unrecognized.unwrap_or(policy_allow);
     let (result, mut reason) = decide(&summary, if timed_out { None } else { code }, parse::is_collect_only(&opts.argv), allow, false);
 
     // A run that changes the tree it tested is still a true statement about the tree it started
@@ -346,20 +461,38 @@ pub fn run(opts: &RunOptions) -> Result<RunOutcome> {
         }
     }
 
-    let json = sign_run(&sk, &fp, &root, &opts.argv, opts.shell, &summary, code, &result, reason, MODE_FRESH, None, started, finished)?;
+    let json =
+        sign_run(&sk, &fp, &nested, &root, &opts.argv, opts.shell, &summary, code, &result, reason, MODE_FRESH, None, started, finished)?;
     let path = store.record(&fp.tree, &fp.key, &json)?;
     if result == "PASSED" || result == "WARNED" {
         store.put_pass(&fp.key, &json, tail(&output, MAX_LOG))?;
+    } else {
+        // A failure of an identical run (for example a flaky test under --no-cache) withdraws any
+        // cached pass, so the next run executes instead of replaying it.
+        store.evict(&fp.key);
     }
     let r = receipt::open_text(&json, std::slice::from_ref(&pk))?;
     Ok(outcome_from_receipt("fresh", &r, json, path, output))
 }
 
 /// Record a receipt for a test command that a host ran itself (PostToolUse hook).
-/// Observed receipts are never put in the run cache.
+/// Observed receipts are never put in the run cache, and by default they do not satisfy the
+/// gate (`accept_observed`); a failing one still counts against a later subset run.
 pub fn record_observed(cwd: &Path, command: &str, output: &str, exit_code: Option<i32>, host: &str) -> Result<Option<RunOutcome>> {
+    record_observed_in(cwd, command, output, exit_code, host, &Context::default())
+}
+
+/// [`record_observed`] with the store and key from `ctx`.
+pub fn record_observed_in(
+    cwd: &Path,
+    command: &str,
+    output: &str,
+    exit_code: Option<i32>,
+    host: &str,
+    ctx: &Context,
+) -> Result<Option<RunOutcome>> {
     let root = crate::git::repo_root(cwd)?;
-    let cfg = Config::load(&root)?;
+    let (env_names, _) = run_policy(&root)?;
     let argv = vec![command.to_string()];
     let summary = parse::parse(output, &argv);
     if !summary.recognized() {
@@ -367,13 +500,28 @@ pub fn record_observed(cwd: &Path, command: &str, output: &str, exit_code: Optio
     }
     let words: Vec<String> = command.split_whitespace().map(String::from).collect();
     let (result, reason) = decide(&summary, exit_code, parse::is_collect_only(&words), false, true);
-    let sk = keys::load_or_create()?;
+    let sk = ctx.signing_key()?;
     let pk = PublicKey { key: sk.verifying_key() };
-    let store = Store::open()?;
-    let fp = fingerprint::compute(&root, cwd, &argv, true, &cfg.run.env)?;
+    let store = ctx.open_store()?;
+    let salt = store.env_salt()?;
+    let (fp, nested) = fingerprint::compute_full(&root, cwd, &argv, true, &env_names, &salt)?;
     let now = now_ms();
-    let json =
-        sign_run(&sk, &fp, &root, &argv, true, &summary, exit_code, &result, reason, MODE_OBSERVED, Some(host.to_string()), now, now)?;
+    let json = sign_run(
+        &sk,
+        &fp,
+        &nested,
+        &root,
+        &argv,
+        true,
+        &summary,
+        exit_code,
+        &result,
+        reason,
+        MODE_OBSERVED,
+        Some(host.to_string()),
+        now,
+        now,
+    )?;
     let path = store.record(&fp.tree, &fp.key, &json)?;
     let r = receipt::open_text(&json, std::slice::from_ref(&pk))?;
     Ok(Some(outcome_from_receipt("observed", &r, json, path, String::new())))

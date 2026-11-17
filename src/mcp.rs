@@ -91,7 +91,7 @@ fn call_tool(name: &str, args: &Value) -> Result<Value> {
         }
         "receipt_query" => {
             let root = crate::git::repo_root(&base_dir(args))?;
-            let cfg = Config::load(&root)?;
+            let cfg = Config::load_committed(&root)?;
             Ok(serde_json::to_value(gate::evaluate(&root, &cfg, None)?)?)
         }
         "receipt_verify" => {

@@ -65,11 +65,57 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
 impl Store {
     /// Open the store at `TREEPROOF_CACHE_DIR`, or the user cache directory.
     pub fn open() -> Result<Store> {
-        let base = match std::env::var_os("TREEPROOF_CACHE_DIR") {
-            Some(p) => PathBuf::from(p),
-            None => dirs::cache_dir().ok_or_else(|| Error::new("no user cache directory; set TREEPROOF_CACHE_DIR"))?.join("treeproof"),
+        Store::open_in(None)
+    }
+
+    /// Open the store under `dir` (the same meaning as `TREEPROOF_CACHE_DIR`), or the default when `None`.
+    pub fn open_in(dir: Option<&Path>) -> Result<Store> {
+        let base = match dir {
+            Some(d) => d.to_path_buf(),
+            None => match std::env::var_os("TREEPROOF_CACHE_DIR") {
+                Some(p) => PathBuf::from(p),
+                None => dirs::cache_dir().ok_or_else(|| Error::new("no user cache directory; set TREEPROOF_CACHE_DIR"))?.join("treeproof"),
+            },
         };
         Ok(Store::at(base.join("v1")))
+    }
+
+    /// The per-machine secret that environment values are keyed with before they enter a
+    /// run key or a receipt (see SPEC.md, section 3.2). Created on first use.
+    pub fn env_salt(&self) -> Result<Vec<u8>> {
+        let p = self.root.join("env.salt");
+        let parse = |t: &str| crate::util::unhex(t.trim()).filter(|b| b.len() == 32);
+        if let Some(b) = std::fs::read_to_string(&p).ok().as_deref().and_then(parse) {
+            return Ok(b);
+        }
+        std::fs::create_dir_all(&self.root).map_err(|e| Error::new(format!("create {}: {e}", self.root.display())))?;
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).map_err(|e| Error::new(format!("system random source failed: {e}")))?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&p) {
+            Ok(mut f) => {
+                use std::io::Write;
+                f.write_all(crate::util::hex(&seed).as_bytes()).map_err(|e| Error::new(format!("write {}: {e}", p.display())))?;
+                Ok(seed.to_vec())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Another process created it first and may still be writing it.
+                for _ in 0..100 {
+                    if let Some(b) = std::fs::read_to_string(&p).ok().as_deref().and_then(parse) {
+                        return Ok(b);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(Error::new(format!("{} is not a valid salt; delete it to start over", p.display())))
+            }
+            Err(e) => Err(Error::new(format!("create {}: {e}", p.display()))),
+        }
     }
 
     pub fn at(root: PathBuf) -> Store {

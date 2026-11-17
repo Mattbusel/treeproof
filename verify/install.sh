@@ -36,7 +36,19 @@ dest="${RUNNER_TEMP}/treeproof-bin"
 mkdir -p "$dest"
 archive="${RUNNER_TEMP}/treeproof.${ext}"
 echo "treeproof: downloading $url"
-curl --fail --location --silent --show-error --retry 3 -o "$archive" "$url"
+if ! curl --fail --location --silent --show-error --retry 3 -o "$archive" "$url"; then
+  if command -v cargo > /dev/null; then
+    echo "treeproof: no prebuilt binary for ${target}${version:+ v$version}; building with cargo install" >&2
+    if [ -n "$version" ]; then
+      cargo install treeproof --locked --version "$version"
+    else
+      cargo install treeproof --locked
+    fi
+    exit 0
+  fi
+  echo "treeproof: no prebuilt binary for ${target} and no cargo on PATH; use install: cargo after a Rust toolchain step" >&2
+  exit 1
+fi
 if [ "$ext" = "zip" ]; then
   unzip -o -q "$archive" -d "$dest"
 else

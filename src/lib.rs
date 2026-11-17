@@ -22,20 +22,16 @@
 //! receipts without this crate.
 //!
 //! ```no_run
-//! use treeproof::run::{run, RunOptions};
-//! let out = run(&RunOptions {
-//!     argv: vec!["cargo".into(), "test".into()],
-//!     shell: false,
-//!     cwd: std::env::current_dir().unwrap(),
-//!     no_cache: false,
-//!     echo: true,
-//!     allow_unrecognized: None,
-//!     timeout: None,
-//! }).unwrap();
+//! use treeproof::run::{run_in, RunOptions};
+//! use treeproof::Context;
+//! let opts = RunOptions::new(vec!["cargo".into(), "test".into()], std::env::current_dir().unwrap()).with_echo(true);
+//! // Context::default() uses TREEPROOF_CACHE_DIR / TREEPROOF_KEY_FILE or the user directories.
+//! let out = run_in(&opts, &Context::default()).unwrap();
 //! println!("{} {} ({} passed)", out.status, out.result, out.counts.passed);
 //! ```
 
 pub mod config;
+pub mod context;
 pub mod dsse;
 pub mod fileguard;
 pub mod fingerprint;
@@ -51,6 +47,8 @@ pub mod run;
 pub mod store;
 pub mod util;
 pub mod verify;
+
+pub use context::Context;
 
 /// The crate's error type: a message meant for a human.
 #[derive(Debug, Clone, PartialEq, Eq)]

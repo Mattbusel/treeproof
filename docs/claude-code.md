@@ -24,19 +24,21 @@ treeproof hooks-config claude
 
 | Event | Matcher | Behaviour |
 |---|---|---|
-| `SessionStart` | all | Records the tree the session started from. |
-| `Stop` | all | If the tree differs from the session's starting tree, requires a valid passing receipt for the current tree. Otherwise returns `{"decision":"block","reason":...}` and the agent keeps working. |
+| `SessionStart` | all | Records the tree the session started from and a snapshot of the policy committed at `HEAD`. |
+| `Stop` | all | If the tree differs from the session's starting tree, requires a valid passing receipt for the current tree that satisfies the session's policy. Otherwise returns `{"decision":"block","reason":...}` and the agent keeps working. |
 | `TaskCompleted` | all | Same check before a task can be marked completed. |
-| `PostToolUse` | `Bash` | When the agent ran a test command itself (`cargo test`, `pytest`, `npm test`, ...) and the output contains a recognised summary, signs an *observed* receipt for the current tree. The agent sees a one-line note with the result. |
+| `PostToolUse` | `Bash` | When the agent ran a plain test command itself (`cargo test`, `pytest`, `npm test`, ... with nothing chained, piped or redirected) and the output contains a recognised summary, signs an *observed* receipt for the current tree. The agent sees a one-line note with the result. Observed passes do not satisfy the gate unless the policy sets `accept_observed`; observed failures do count against a later narrower run. |
 | `PostToolUse` | `Read`, `Edit`, `Write`, ... | FileGuard: remembers the content hash of each file the agent read or wrote. |
-| `PreToolUse` | `Edit`, `Write`, ... | FileGuard: denies an edit when the file changed on disk since the agent last saw it. Also denies writes to the signing key or receipt store. |
-| `PreToolUse` | `Bash` | Denies `treeproof hook ...` and commands that touch the signing key or receipt store. |
+| `PreToolUse` | `Edit`, `Write`, ... | FileGuard: denies an edit when the file changed on disk since the agent last saw it. Also denies writes to the signing key, the receipt store and `treeproof.toml`. |
+| `PreToolUse` | `Bash` | Denies `treeproof hook ...`, commands that touch the signing key or receipt store, and commands that write `treeproof.toml`. |
 
 `SubagentStop` is not gated by default (subagents often hand back partial work). Set `TREEPROOF_GATE_SUBAGENTS=1` to gate it too.
 
 ## Behaviour details
 
-- **Nothing changed, nothing asked.** A session that never changes the tree can stop freely. Without a `SessionStart` record (plugin enabled mid-session), the baseline is `HEAD`'s tree.
+- **Nothing changed, nothing asked.** A session that never changes the tree can stop freely. Without a `SessionStart` record (plugin enabled mid-session), the first `PreToolUse` or `PostToolUse` call records the baseline; if `Stop` is the first hook the session sends, the baseline is where the branch left its upstream, or `HEAD`'s tree when there is no upstream. Commits made during the session do not move the baseline.
+- **The policy is fixed for the session.** The gate uses `treeproof.toml` as committed when the session started. Editing or committing it mid-session has no effect until the next session, and the agent's tools may not write it.
+- **Whole suite.** A run that selected part of the suite (`cargo test foo`, `pytest -k`, `pytest file.py::test`, ...) does not satisfy the gate unless the policy pins that command or sets `allow_subset`, and a failing run blocks until the same command passes again. See [configuration.md](configuration.md).
 - **Loop protection.** After `max_blocks` (default 3) consecutive blocks on the same tree in one session, the hook lets the agent stop and shows a `systemMessage` saying the tree is unverified. Claude Code also caps consecutive stop-hook continuations on its own.
 - **Fail open.** If treeproof itself errors (no git, unreadable store), the hook reports the error as a `systemMessage` and does not block.
 - **Modes.** `TREEPROOF_GATE=warn` (or `[gate] mode = "warn"`) never blocks and only warns; `off` disables the gate.
@@ -58,4 +60,6 @@ A real `claude -p` session (Claude Code 2.1.326, `--plugin-dir plugin`) on a fix
 2. The `Stop` hook answered: `treeproof: no treeproof receipt exists for the current tree 971675d9038a. Run the test suite through treeproof, for example treeproof run -- <your test command>, fix any failures, and finish only when it passes.`
 3. The agent ran `treeproof run -- python run_tests.py` (fresh PASSED, 3 passed) and stopped; the hook let it through.
 
-A bare `python run_tests.py` is not recorded as an observed run because the command does not name a known runner (`cargo test`, `pytest`, `npm test`, `go test`, ...). Observed recording only looks at commands that do.
+A bare `python run_tests.py` is not recorded as an observed run because the command does not name a known runner (`cargo test`, `pytest`, `npm test`, `go test`, ...). Observed recording only looks at plain invocations of those, and since treeproof 0.1.1 observed passes do not open the gate by default.
+
+(The live run above was recorded with treeproof 0.1.0.)

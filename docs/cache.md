@@ -22,7 +22,8 @@ A cached pass is reused only when all of these match (details in [SPEC.md](../SP
 - the exact argv (or shell command line) and the working directory inside the repository,
 - versions of the toolchains the command uses (`rustc`/`cargo`, `python`, `node`, `bun`, `deno`, `go`),
 - the hashes of lockfiles at the root and in the working directory,
-- allowlisted environment variables (hashed) plus any listed under `[run] env`,
+- allowlisted environment variables plus any listed under `[run] env`, as HMAC-SHA256 under a per-machine secret (`env.salt` in the store), so receipts do not publish guessable hashes of their values,
+- the working-tree digests of nested repositories (submodules), when there are any,
 - OS and architecture.
 
 ## Rules

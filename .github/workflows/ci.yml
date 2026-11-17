@@ -116,7 +116,39 @@ jobs:
         uses: ./verify
         with:
           install: none
+          trust-ref: HEAD
           working-directory: ${{ env.FIXTURE }}
+      - name: Make a pull request signed by a key the base branch does not trust
+        shell: bash
+        run: |
+          set -euo pipefail
+          pr="$RUNNER_TEMP/fixture-pr"
+          git clone -q "$FIXTURE" "$pr" && cd "$pr"
+          git config user.email ci@example.com && git config user.name ci
+          git tag base
+          py=python3; [ "$RUNNER_OS" = Windows ] && py=python
+          echo "pr change" > lib.txt
+          export TREEPROOF_KEY_FILE="$RUNNER_TEMP/attacker.key" TREEPROOF_CACHE_DIR="$RUNNER_TEMP/attackercache"
+          treeproof run -- "$py" run_tests.py
+          treeproof export
+          git add -A && git commit -q -m "pr with its own key"
+          echo "FIXTURE_PR=$pr" >> "$GITHUB_ENV"
+      - name: The pull request's own key is not trusted (must fail)
+        id: untrusted
+        continue-on-error: true
+        uses: ./verify
+        with:
+          install: none
+          trust-ref: base
+          rerun: "false"
+          working-directory: ${{ env.FIXTURE_PR }}
+      - name: The same receipt verifies when its head is trusted (control)
+        uses: ./verify
+        with:
+          install: none
+          trust-ref: HEAD
+          rerun: "false"
+          working-directory: ${{ env.FIXTURE_PR }}
       - name: Re-run disagrees with the receipt (must fail)
         id: mismatch
         continue-on-error: true
@@ -125,6 +157,7 @@ jobs:
           FAKE_FAIL: "1"
         with:
           install: none
+          trust-ref: HEAD
           working-directory: ${{ env.FIXTURE }}
       - name: Tamper with the committed receipt
         shell: bash
@@ -138,14 +171,16 @@ jobs:
         uses: ./verify
         with:
           install: none
+          trust-ref: HEAD
           rerun: "false"
           working-directory: ${{ env.FIXTURE }}
       - name: Check the must-fail cases failed
         shell: bash
         run: |
-          echo "mismatch=${{ steps.mismatch.outcome }} tampered=${{ steps.tampered.outcome }}"
+          echo "mismatch=${{ steps.mismatch.outcome }} tampered=${{ steps.tampered.outcome }} untrusted=${{ steps.untrusted.outcome }}"
           test "${{ steps.mismatch.outcome }}" = failure
           test "${{ steps.tampered.outcome }}" = failure
+          test "${{ steps.untrusted.outcome }}" = failure
 
   plugin:
     name: plugin manifests are valid JSON
