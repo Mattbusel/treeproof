@@ -1,0 +1,12 @@
+{
+  "name": "treeproof",
+  "description": "Verification receipts for coding agents",
+  "owner": { "name": "Matthew Busel", "url": "https://github.com/Mattbusel" },
+  "plugins": [
+    {
+      "name": "treeproof",
+      "source": "./plugin",
+      "description": "Block Stop/TaskCompleted until a fresh, signed, passing test receipt exists for the current git tree."
+    }
+  ]
+}

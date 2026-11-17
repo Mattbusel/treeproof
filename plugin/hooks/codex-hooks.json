@@ -1,0 +1,60 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "treeproof hook PostToolUse",
+            "timeout": 120,
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash"
+      },
+      {
+        "hooks": [
+          {
+            "command": "treeproof hook PostToolUse",
+            "timeout": 120,
+            "type": "command"
+          }
+        ],
+        "matcher": "apply_patch"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "treeproof hook PreToolUse",
+            "timeout": 120,
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash|apply_patch"
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "treeproof hook SessionStart",
+            "timeout": 120,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "treeproof hook Stop",
+            "timeout": 120,
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  }
+}

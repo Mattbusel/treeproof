@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "treeproof": {
+      "command": "treeproof",
+      "args": ["mcp"]
+    }
+  }
+}

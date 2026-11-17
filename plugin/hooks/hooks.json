@@ -1,0 +1,71 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "treeproof hook PostToolUse",
+            "timeout": 120,
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash"
+      },
+      {
+        "hooks": [
+          {
+            "command": "treeproof hook PostToolUse",
+            "timeout": 120,
+            "type": "command"
+          }
+        ],
+        "matcher": "Read|Edit|Write|MultiEdit|NotebookEdit"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "treeproof hook PreToolUse",
+            "timeout": 120,
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit"
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "treeproof hook SessionStart",
+            "timeout": 120,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "treeproof hook Stop",
+            "timeout": 120,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "TaskCompleted": [
+      {
+        "hooks": [
+          {
+            "command": "treeproof hook TaskCompleted",
+            "timeout": 120,
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  }
+}

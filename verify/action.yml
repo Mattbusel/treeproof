@@ -1,0 +1,60 @@
+name: treeproof verify
+description: Verify the signed treeproof receipt for this commit's tree and re-run its test command; fail on any mismatch.
+author: Matthew Busel
+branding:
+  icon: check-circle
+  color: green
+
+inputs:
+  receipts:
+    description: Glob of receipt files (relative to working-directory).
+    default: .treeproof/receipts/*.json
+  rerun:
+    description: Re-run each matching receipt's command and fail if the result disagrees.
+    default: "true"
+  require-current-tree:
+    description: Only accept receipts whose subject is the checked-out tree, and require at least one.
+    default: "true"
+  keys:
+    description: Extra trusted public key files, one per line. Keys in .treeproof/trusted_keys/ are always trusted.
+    default: ""
+  version:
+    description: treeproof version to install (for example 0.1.0). Empty means the version in the action ref when it is a version tag, otherwise the latest release.
+    default: ""
+  install:
+    description: "How to get treeproof: release (prebuilt binary), cargo (cargo install), or none (already on PATH)."
+    default: release
+  working-directory:
+    description: Repository directory to verify.
+    default: .
+
+outputs:
+  ok:
+    description: "\"true\" when verification passed."
+    value: ${{ steps.verify.outputs.ok }}
+  report:
+    description: Path of the JSON verification report.
+    value: ${{ steps.verify.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install treeproof
+      if: inputs.install != 'none'
+      shell: bash
+      env:
+        TP_INSTALL: ${{ inputs.install }}
+        TP_VERSION: ${{ inputs.version }}
+        TP_ACTION_REF: ${{ github.action_ref }}
+      run: bash "$GITHUB_ACTION_PATH/install.sh"
+
+    - name: Verify receipts
+      id: verify
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        TP_RECEIPTS: ${{ inputs.receipts }}
+        TP_RERUN: ${{ inputs.rerun }}
+        TP_CURRENT: ${{ inputs.require-current-tree }}
+        TP_KEYS: ${{ inputs.keys }}
+      run: bash "$GITHUB_ACTION_PATH/verify.sh"

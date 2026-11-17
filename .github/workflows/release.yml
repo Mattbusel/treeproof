@@ -1,0 +1,154 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  binaries:
+    name: binary ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, ext: tar.gz }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, ext: tar.gz }
+          - { os: macos-latest, target: aarch64-apple-darwin, ext: tar.gz }
+          - { os: macos-latest, target: x86_64-apple-darwin, ext: tar.gz }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, ext: zip }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="treeproof-${{ matrix.target }}"
+          mkdir -p dist stage
+          bin=target/${{ matrix.target }}/release/treeproof
+          if [ -f "$bin.exe" ]; then bin="$bin.exe"; fi
+          cp "$bin" stage/
+          cp README.md LICENSE-MIT LICENSE-APACHE stage/
+          if [ "${{ matrix.ext }}" = zip ]; then
+            (cd stage && 7z a -tzip "../dist/$name.zip" . > /dev/null)
+          else
+            tar -czf "dist/$name.tar.gz" -C stage .
+          fi
+      - name: Smoke test
+        if: matrix.target != 'x86_64-apple-darwin'
+        shell: bash
+        run: ./stage/treeproof --version || ./stage/treeproof.exe --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: dist/*
+
+  wheels:
+    name: wheel ${{ matrix.os }} ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64, manylinux: auto }
+          - { os: ubuntu-24.04-arm, target: aarch64, manylinux: auto }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, manylinux: musllinux_1_2 }
+          - { os: macos-latest, target: aarch64, manylinux: "" }
+          - { os: macos-latest, target: x86_64, manylinux: "" }
+          - { os: windows-latest, target: x64, manylinux: "" }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}-${{ matrix.target }}
+          path: dist/*.whl
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  github-release:
+    needs: [binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          merge-multiple: true
+          path: dist
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          python3 tests/ci/release_notes.py "${tag#v}" > notes.md
+          gh release create "$tag" dist/* --title "treeproof $tag" --notes-file notes.md
+
+  pypi:
+    needs: [wheels, sdist, github-release]
+    if: vars.PYPI_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "{wheel-*,sdist}"
+          merge-multiple: true
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  npm:
+    needs: [github-release]
+    if: vars.NPM_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Publish
+        working-directory: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          test "$(node -p "require('./package.json').version")" = "${GITHUB_REF_NAME#v}"
+          npm publish --provenance --access public

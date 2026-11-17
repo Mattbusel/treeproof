@@ -1,0 +1,13 @@
+{
+  "name": "treeproof",
+  "version": "0.1.0",
+  "description": "Signed test-result receipts for a git tree (in-toto test-result), a cross-worktree result cache, and done-gates for coding agents. Downloads the prebuilt treeproof binary.",
+  "bin": { "treeproof": "bin/treeproof.js" },
+  "scripts": { "postinstall": "node bin/install.js" },
+  "files": ["bin/"],
+  "engines": { "node": ">=18" },
+  "repository": { "type": "git", "url": "git+https://github.com/Mattbusel/treeproof.git" },
+  "homepage": "https://github.com/Mattbusel/treeproof",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["in-toto", "attestation", "testing", "agents", "mcp", "claude-code", "codex"]
+}

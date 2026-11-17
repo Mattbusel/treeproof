@@ -1,0 +1,38 @@
+[package]
+name = "treeproof"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "Signed test-result receipts for a git tree: in-toto test-result attestations, a cross-worktree result cache, and done-gates for coding agents (Claude Code, Codex, MCP, GitHub Actions)."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Mattbusel/treeproof"
+documentation = "https://docs.rs/treeproof"
+readme = "README.md"
+keywords = ["in-toto", "attestation", "testing", "agents", "mcp"]
+categories = ["development-tools::testing", "command-line-utilities", "cryptography"]
+include = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "README.md", "SPEC.md", "LICENSE-MIT", "LICENSE-APACHE", "docs/**"]
+
+[[bin]]
+name = "treeproof"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+dirs = "6"
+ed25519-dalek = "2.2"
+getrandom = "0.3"
+regex-lite = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+toml = "0.9"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true
