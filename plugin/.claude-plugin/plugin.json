@@ -3,9 +3,19 @@
   "displayName": "treeproof",
   "version": "0.1.2",
   "description": "Signed test receipts for the current git tree. Blocks Stop and TaskCompleted until a fresh passing receipt exists, records Bash test runs, refuses stale edits, and adds the receipt_run/receipt_query/receipt_verify MCP tools.",
-  "author": { "name": "Matthew Busel", "url": "https://github.com/Mattbusel" },
+  "author": {
+    "name": "Matthew Busel",
+    "url": "https://github.com/Mattbusel"
+  },
   "homepage": "https://github.com/Mattbusel/treeproof",
   "repository": "https://github.com/Mattbusel/treeproof",
   "license": "MIT OR Apache-2.0",
-  "keywords": ["testing", "verification", "in-toto", "hooks", "receipts"]
+  "privacyPolicyUrl": "https://github.com/Mattbusel/treeproof/blob/main/docs/privacy.md",
+  "keywords": [
+    "testing",
+    "verification",
+    "in-toto",
+    "hooks",
+    "receipts"
+  ]
 }
