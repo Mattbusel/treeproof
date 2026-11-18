@@ -232,7 +232,10 @@ fn cmd_verify(
         let rr = need_root("--keys-ref")?;
         extra.extend(keys::trusted_keys_at_rev(&rr, r)?);
         None
-    } else if no_repo_keys {
+    } else if no_repo_keys || rerun {
+        // --rerun executes the receipt's command: keys from the checkout are never trusted for
+        // that (a cloned repository could sign its own receipt). Use --key, --keys-ref or
+        // TREEPROOF_TRUSTED_KEYS for someone else's receipts.
         None
     } else {
         root.clone()
@@ -241,7 +244,8 @@ fn cmd_verify(
     if trusted.is_empty() {
         let where_ = keys_ref.as_deref().map(|r| format!(" at {r}")).unwrap_or_default();
         return Err(Error::new(format!(
-            "no trusted keys: none committed under .treeproof/trusted_keys/{where_} and none given with --key. Commit the signer's public key (treeproof key export) to the base branch first."
+            "no trusted keys: none committed under .treeproof/trusted_keys/{where_} and none given with --key{}. Commit the signer's public key (treeproof key export) to the base branch first.",
+            if rerun && keys_ref.is_none() { " (with --rerun the working copy's keys are not trusted; pass --keys-ref <rev> or --key)" } else { "" }
         )));
     }
     let current = tree.as_deref() == Some("current");
@@ -467,7 +471,7 @@ fn hooks_config(host: &str) -> Result<serde_json::Value> {
 
 fn cmd_otel(file: Option<PathBuf>, rerun: bool, endpoint: Option<String>, dry_run: bool) -> Result<ExitCode> {
     let root = git::repo_root(&cwd()).ok();
-    let trusted = keys::trusted_keys(root.as_deref(), true, &[])?;
+    let trusted = if rerun { keys::rerun_trusted_keys(&[])? } else { keys::trusted_keys(root.as_deref(), true, &[])? };
     let current = root.as_deref().and_then(|r| git::tree_digest(r).ok());
     let text = match &file {
         Some(f) => std::fs::read_to_string(f).map_err(|e| Error::new(format!("read {}: {e}", f.display())))?,
@@ -522,7 +526,7 @@ fn cmd_otel(file: Option<PathBuf>, rerun: bool, endpoint: Option<String>, dry_ru
         return Ok(ExitCode::SUCCESS);
     }
     let ep = endpoint
-        .or_else(otlp::endpoint_from_env)
+        .or_else(|| otlp::endpoint_from_env_with(true))
         .ok_or_else(|| Error::new("no OTLP endpoint: pass --endpoint or set TREEPROOF_OTLP_ENDPOINT / OTEL_EXPORTER_OTLP_ENDPOINT"))?;
     let code = otlp::post(&ep, &body, &otlp::headers_from_env())?;
     eprintln!("treeproof: sent {} evaluation event(s) to {ep}: HTTP {code}", evals.len());

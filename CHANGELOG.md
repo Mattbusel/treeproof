@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.2
+
+Fixes from the buildwithclaude plugin directory review. Upgrade the binary and the plugin together.
+
+- **MCP `receipt_run` is no longer a general command runner.** MCP tools run outside the host's Bash permissions, deny rules and sandbox, so `receipt_run` now runs only a command that matches the `[gate] commands` committed at `HEAD`, or, when none are committed, a recognised test runner with standard arguments (`cargo test`, `cargo nextest run`, `pytest`, `python -m pytest`, `go test ./...`, `npm`/`pnpm`/`yarn`/`bun test`, `jest`, `vitest run`, `npx jest`/`npx vitest run`, with a short list of flags each). Anything else is refused with an error that says why and what is allowed. Commands are split on whitespace and run without a shell; quotes and shell syntax are refused. The same check applies to MCP `receipt_verify` re-runs.
+- **The MCP server no longer tells the client to run tests through `receipt_run` instead of directly.** Its instructions now point at `receipt_query` before claiming work is done and say `receipt_run` is not a general shell. The skill tells the agent to use `treeproof run -- <cmd>` through its normal Bash tool, where the host's permissions apply.
+- **Re-runs never trust keys from the checkout.** `treeproof verify --rerun`, `treeproof otel --rerun` and MCP `receipt_verify` with `rerun` ignore `.treeproof/trusted_keys/` in the working copy, the same rule as the local gate, so a cloned repository cannot sign its own receipt and have its command executed. Trusted for re-runs: this machine's key, `TREEPROOF_TRUSTED_KEYS`, `--key`, and `--keys-ref <rev>` (what the GitHub Action uses). New `keys::rerun_trusted_keys`.
+- **OTLP export from the hooks is opt-in.** The generic `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` no longer turn on the `Stop` hook's export by themselves; they count only with `TREEPROOF_OTEL=1`. `TREEPROOF_OTLP_ENDPOINT` still turns it on, and `TREEPROOF_OTEL=0` still turns everything off. `treeproof otel`, run by hand, still reads the generic variables. New `otlp::endpoint_from_env_with` and `otlp::generic_otel_opted_in`.
+- **Pinned binary.** The plugin's `SessionStart` hook warns when the `treeproof` on `PATH` is a different version from the plugin. Install docs use `cargo install treeproof --version 0.1.2 --locked` and show how to check release archives against `SHA256SUMS`.
+- Docs: the gate is on in every git repository once the plugin is enabled, and how to turn it off (`[gate] mode = "off"`, `TREEPROOF_GATE=off`, or disabling the plugin); what the OTLP events contain and when they are sent; `plugin/README.md`; MCP, threat model and configuration docs describe the above.
+
 ## 0.1.1
 
 Security fixes for the gate, from an independent review of 0.1.0. Upgrade if you rely on the gate or the Action.

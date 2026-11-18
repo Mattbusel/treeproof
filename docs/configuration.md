@@ -54,11 +54,12 @@ When a run of a command records failing tests on a tree, the gate stays closed f
 | `TREEPROOF_KEY_FILE` | Path of the Ed25519 signing key (default: `<config dir>/treeproof/signing.key`). |
 | `TREEPROOF_CACHE_DIR` | Parent directory of the store (default: `<cache dir>/treeproof`). |
 | `TREEPROOF_TRUSTED_KEYS` | Extra public key files to trust, separated like `PATH`. |
-| `TREEPROOF_GATE` | Overrides `[gate] mode` (`block`, `warn`, `off`). Read by the hook process from the host's environment. |
+| `TREEPROOF_GATE` | Overrides `[gate] mode` (`block`, `warn`, `off`). Read by the hook process from the host's environment. With the plugin enabled the gate is on in every git repository; `TREEPROOF_GATE=off` turns it off everywhere. |
 | `TREEPROOF_GATE_SUBAGENTS` | `1` gates `SubagentStop` too. |
 | `TREEPROOF_FILEGUARD` | `0` disables FileGuard. |
 | `TREEPROOF_RUN_URL` | Written to the predicate's `url` (for example a CI run link). |
-| `TREEPROOF_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_*`, `TREEPROOF_OTEL` | See [otel.md](otel.md). |
+| `TREEPROOF_OTLP_ENDPOINT` | OTLP/HTTP endpoint the hooks export evaluation events to. Unset by default: nothing is sent. |
+| `TREEPROOF_OTEL` | `1` lets the hooks also use the generic `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`; `0` turns all export off. See [otel.md](otel.md). |
 
 Commands run under `treeproof run` see `TREEPROOF_ACTIVE=1`.
 

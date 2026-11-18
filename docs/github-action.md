@@ -42,7 +42,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable     # whatever the receipt's command needs
-      - uses: Mattbusel/treeproof/verify@v0.1.1
+      - uses: Mattbusel/treeproof/verify@v0.1.2
 ```
 
 Put the action right after checkout and toolchain setup: steps that write files the repository does not ignore would change the tree before it is measured. If the base commit is not in a shallow checkout, the action fetches it. Repositories with submodules need `submodules: recursive` on checkout, because receipts record the content of nested repositories.

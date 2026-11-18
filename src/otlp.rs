@@ -118,10 +118,25 @@ pub fn build_request(evals: &[Evaluation], extra_attrs: &[(String, String)], tra
     })
 }
 
-/// Resolve the logs endpoint from `TREEPROOF_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`
-/// or `OTEL_EXPORTER_OTLP_ENDPOINT` (+ `/v1/logs`). Returns `None` when export is not configured
-/// or the configured protocol is gRPC (only HTTP/JSON is spoken).
+/// Is automatic export allowed to use the generic `OTEL_EXPORTER_OTLP_*` endpoints?
+/// Only when `TREEPROOF_OTEL=1` (or `on`/`true`): those variables are often set for other tools,
+/// and the hooks should not start sending events just because they are.
+pub fn generic_otel_opted_in() -> bool {
+    std::env::var("TREEPROOF_OTEL").map(|v| v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true")).unwrap_or(false)
+}
+
+/// The endpoint the hooks export to, if any. See [`endpoint_from_env_with`]; the generic
+/// `OTEL_EXPORTER_OTLP_*` variables count only with `TREEPROOF_OTEL=1`.
 pub fn endpoint_from_env() -> Option<String> {
+    endpoint_from_env_with(generic_otel_opted_in())
+}
+
+/// Resolve the logs endpoint from `TREEPROOF_OTLP_ENDPOINT`, then (when `generic` is true)
+/// `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT` (+ `/v1/logs`). Returns
+/// `None` when export is not configured, `TREEPROOF_OTEL=0`, or the configured protocol is gRPC
+/// (only HTTP/JSON is spoken). `treeproof otel` passes `generic = true` because the user asked
+/// for an export.
+pub fn endpoint_from_env_with(generic: bool) -> Option<String> {
     if std::env::var("TREEPROOF_OTEL").map(|v| v == "0" || v.eq_ignore_ascii_case("off")).unwrap_or(false) {
         return None;
     }
@@ -129,6 +144,9 @@ pub fn endpoint_from_env() -> Option<String> {
         if !e.is_empty() {
             return Some(e);
         }
+    }
+    if !generic {
+        return None;
     }
     let proto =
         std::env::var("OTEL_EXPORTER_OTLP_LOGS_PROTOCOL").or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_PROTOCOL")).unwrap_or_default();

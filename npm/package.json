@@ -1,6 +1,6 @@
 {
   "name": "treeproof",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Signed test-result receipts for a git tree (in-toto test-result), a cross-worktree result cache, and done-gates for coding agents. Downloads the prebuilt treeproof binary.",
   "bin": { "treeproof": "bin/treeproof.js" },
   "scripts": { "postinstall": "node bin/install.js" },

@@ -25,7 +25,7 @@ inputs:
       and HEAD otherwise.
     default: ""
   version:
-    description: treeproof version to install (for example 0.1.1). Empty means the version in the action ref when it is a version tag, otherwise the latest release.
+    description: treeproof version to install (for example 0.1.2). Empty means the version in the action ref when it is a version tag, otherwise the latest release.
     default: ""
   install:
     description: "How to get treeproof: release (prebuilt binary), cargo (cargo install), or none (already on PATH)."

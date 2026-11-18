@@ -4,13 +4,27 @@ The treeproof plugin turns "done" into "done with a passing receipt for the curr
 
 ## Install
 
-1. Install the binary so it is on `PATH`: `cargo install treeproof` or a release archive.
+1. Install the binary so it is on `PATH`, pinned to the plugin's version: `cargo install treeproof --version 0.1.2 --locked`, or the v0.1.2 release archive checked against its `SHA256SUMS` (see [install.md](install.md)). The hooks run whatever `treeproof` is on `PATH`; the `SessionStart` hook warns when that binary's version differs from the plugin's.
 2. In Claude Code:
 
    ```text
    /plugin marketplace add Mattbusel/treeproof
    /plugin install treeproof@treeproof
    ```
+
+## On by default, and how to turn it off
+
+Once the plugin is enabled, the gate applies in **every git repository** you open, not only ones with a `treeproof.toml`: a session that changes the tree has to end with a passing `treeproof run` for that tree. Sessions that change nothing, and directories that are not git repositories, are never gated. After 3 blocks on the same tree it lets the agent stop with a warning.
+
+To turn it off or soften it:
+
+| Scope | How |
+|---|---|
+| One repository | Commit `treeproof.toml` with `[gate]` `mode = "off"` (or `"warn"`). It applies from the next session. |
+| Everywhere | `TREEPROOF_GATE=off` (or `warn`) in the environment Claude Code runs in, for example `"env": {"TREEPROOF_GATE": "off"}` in `~/.claude/settings.json`. |
+| The plugin | `/plugin disable treeproof@treeproof`. |
+
+## Plugin contents
 
 The plugin lives in [`plugin/`](../plugin). It contains hooks, the MCP server entry and a short skill that tells the agent to run tests through treeproof.
 
@@ -31,6 +45,10 @@ treeproof hooks-config claude
 | `PostToolUse` | `Read`, `Edit`, `Write`, ... | FileGuard: remembers the content hash of each file the agent read or wrote. |
 | `PreToolUse` | `Edit`, `Write`, ... | FileGuard: denies an edit when the file changed on disk since the agent last saw it. Also denies writes to the signing key, the receipt store and `treeproof.toml`. |
 | `PreToolUse` | `Bash` | Denies `treeproof hook ...`, commands that touch the signing key or receipt store, and commands that write `treeproof.toml`. |
+
+The MCP server's `receipt_run` tool runs outside Claude Code's Bash permissions and sandbox, so it only runs the commands committed in `treeproof.toml` `[gate] commands`, or, when none are committed, a recognised test runner with standard arguments, and never through a shell. See [mcp.md](mcp.md). The skill tells the agent to run tests with `treeproof run -- <cmd>` through its normal Bash tool, where your permission rules apply.
+
+The hooks send nothing over the network unless you opt in to OTLP export (`TREEPROOF_OTLP_ENDPOINT`, or `TREEPROOF_OTEL=1` with the generic `OTEL_EXPORTER_OTLP_ENDPOINT`). See [otel.md](otel.md).
 
 `SubagentStop` is not gated by default (subagents often hand back partial work). Set `TREEPROOF_GATE_SUBAGENTS=1` to gate it too.
 

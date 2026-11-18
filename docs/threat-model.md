@@ -23,6 +23,8 @@ treeproof is aimed at one failure: an agent (or a person) reporting that tests p
 | A pull request weakens `treeproof.toml` | The Action applies the policy from the base branch. |
 | A receipt was produced on a machine where the tests happened to pass | The Action re-runs the command in CI and fails on disagreement. |
 | Two agents edit the same file | FileGuard denies the second edit until the agent re-reads the file. |
+| The agent uses the MCP `receipt_run` tool to run something that is not a test (outside the host's Bash permissions and sandbox) | Refused: `receipt_run` runs only the committed `[gate] commands`, or a recognised test runner with standard arguments, and never through a shell. |
+| A cloned repository ships a key in `.treeproof/trusted_keys/` and a receipt signed with it, hoping `verify --rerun` or MCP `receipt_verify` with `rerun` executes its command | The signature does not verify: re-runs trust only this machine's key, `TREEPROOF_TRUSTED_KEYS`, `--key` and `--keys-ref`, never the working copy's keys. Nothing is executed. |
 
 ## What it does not stop
 
@@ -43,10 +45,12 @@ treeproof is aimed at one failure: an agent (or a person) reporting that tests p
 |---|---|---|
 | Claude Code / Codex hooks | `treeproof.toml` committed at `HEAD` when the session started | This machine's key and `TREEPROOF_TRUSTED_KEYS` |
 | `treeproof gate`, `status`, `export`, MCP `receipt_query` | `treeproof.toml` committed at `HEAD` (or `--policy-ref`) | This machine's key and `TREEPROOF_TRUSTED_KEYS` |
-| `treeproof verify --tree current` | `HEAD` by default, or `--policy-ref` | `--key`, `--keys-ref <rev>`, or the working copy's `.treeproof/trusted_keys/` |
+| `treeproof verify --tree current` | `HEAD` by default, or `--policy-ref` | `--key`, `--keys-ref <rev>`, or the working copy's `.treeproof/trusted_keys/` (not with `--rerun`) |
+| `treeproof verify --rerun`, MCP `receipt_verify` with `rerun` | as above | This machine's key, `TREEPROOF_TRUSTED_KEYS`, `--key`, `--keys-ref <rev>`; never the working copy's keys |
+| MCP `receipt_run` | `[gate] commands` committed at `HEAD` decide what may run | n/a |
 | GitHub Action | The pull request's base commit (`trust-ref`) | Keys committed at the base commit, plus the `keys` input |
 
-The working copy's `treeproof.toml` and `.treeproof/trusted_keys/` are never trusted by a gate.
+The working copy's `treeproof.toml` and `.treeproof/trusted_keys/` are never trusted by a gate, and the working copy's keys are never trusted for a re-run.
 
 ## The CI check is the strong one
 

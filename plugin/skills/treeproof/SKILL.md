@@ -7,7 +7,7 @@ This repository gates "done" on a treeproof receipt: a signed record that this e
 
 1. Run tests through treeproof, never bare:
    `treeproof run -- cargo test` (or `pytest`, `npm test`, `go test ./...`, the project's usual command).
-   The `receipt_run` MCP tool does the same thing.
+   The `receipt_run` MCP tool does the same for the repository's committed test command or a standard runner invocation; it refuses anything else, so use your normal shell for other commands.
 2. If the result is FAILED, fix the code and run it again. A run with 0 tests, an unrecognised runner, `--collect-only`, or any failing test is FAILED.
 3. Run the whole suite. A run of part of it (a test-name filter, `-k`, `file.py::test`, `-run`, `-t`) does not count, and after a failing run the same command has to pass again.
 4. Any edit after a passing run changes the tree, so run the tests again after your last edit.

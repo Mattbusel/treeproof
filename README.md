@@ -20,10 +20,12 @@ treeproof turns "the tests passed" into a checkable fact:
 ## Install
 
 ```sh
-cargo install treeproof
+cargo install treeproof --version 0.1.2 --locked
 ```
 
-Prebuilt binaries for Linux (x86_64, aarch64), macOS and Windows are on the [releases page](https://github.com/Mattbusel/treeproof/releases) (v0.1.0 has no Intel macOS build; use `cargo install` there). A Python wheel (`pip install treeproof`) and an npm shim (`npm i -g treeproof`) that install the same binary are built by the release workflow; see [docs/install.md](docs/install.md) for their status.
+Pin the version. The Claude Code plugin and its hooks call whatever `treeproof` is on `PATH`, so install the version that matches the plugin (the plugin's `SessionStart` hook warns when they differ). `--locked` builds with the dependency versions in the published `Cargo.lock`.
+
+Prebuilt binaries for Linux (x86_64, aarch64), macOS and Windows are on the [releases page](https://github.com/Mattbusel/treeproof/releases), with a `SHA256SUMS` file in each release. Check the archive before you unpack it, for example `sha256sum -c SHA256SUMS --ignore-missing` (v0.1.0 has no Intel macOS build; use `cargo install` there). A Python wheel (`pip install treeproof`) and an npm shim (`npm i -g treeproof`) that install the same binary are built by the release workflow; see [docs/install.md](docs/install.md) for their status.
 
 ## Use it
 
@@ -43,8 +45,8 @@ Supported runners: `cargo test` (libtest, including doctests), `cargo nextest`, 
 |---|---|---|
 | Claude Code plugin | `Stop` and `TaskCompleted` hooks block completion until a passing receipt exists for the current tree; `PostToolUse` records test runs the agent made with Bash; FileGuard refuses edits to files that changed since the agent read them | [docs/claude-code.md](docs/claude-code.md) |
 | Codex hooks | Same gate and recording through Codex's `Stop`, `PostToolUse` and `PreToolUse` hooks | [docs/codex.md](docs/codex.md) |
-| MCP server | `receipt_run`, `receipt_query`, `receipt_verify` for any MCP client | [docs/mcp.md](docs/mcp.md) |
-| GitHub Action | `uses: Mattbusel/treeproof/verify@v0.1.1` verifies the committed receipt against keys and policy from the base branch, re-runs its command on the checked-out tree, and fails on any mismatch | [docs/github-action.md](docs/github-action.md) |
+| MCP server | `receipt_run` (only the committed `[gate] commands` or a recognised test runner, never a general shell), `receipt_query`, `receipt_verify` for any MCP client | [docs/mcp.md](docs/mcp.md) |
+| GitHub Action | `uses: Mattbusel/treeproof/verify@v0.1.2` verifies the committed receipt against keys and policy from the base branch, re-runs its command on the checked-out tree, and fails on any mismatch | [docs/github-action.md](docs/github-action.md) |
 | Orchestrators | `treeproof gate --json`, `treeproof verify --json`, or the Rust crate | [docs/orchestrators.md](docs/orchestrators.md) |
 
 Claude Code:
@@ -54,7 +56,13 @@ Claude Code:
 /plugin install treeproof@treeproof
 ```
 
-The plugin calls the `treeproof` binary, so install that first.
+The plugin calls the `treeproof` binary, so install that first, pinned to the plugin's version: `cargo install treeproof --version 0.1.2 --locked`.
+
+**The gate is on in every git repository by default.** Once the plugin is enabled, any session that changes files in a git repository has to end with a passing `treeproof run` for that tree (or hits the 3-block limit and stops with a warning). To turn it off:
+
+- for one repository: commit `treeproof.toml` with `[gate]` `mode = "off"` (or `"warn"` to only warn);
+- for everything: set `TREEPROOF_GATE=off` (or `warn`) in the environment Claude Code runs in, for example `"env": {"TREEPROOF_GATE": "off"}` in `~/.claude/settings.json`;
+- or disable the plugin: `/plugin disable treeproof@treeproof`.
 
 ## What a stop looks like
 
@@ -89,6 +97,14 @@ enabled = true
 The gate reads this file as committed, never from the working copy: hooks use the version committed when the session started, `treeproof gate` uses `HEAD`, and the GitHub Action uses the pull request's base commit. See [docs/configuration.md](docs/configuration.md).
 
 ## Telemetry (OpenTelemetry)
+
+**Nothing is sent anywhere by default.** treeproof has no usage telemetry and no phone-home. The only network traffic it can make is an OTLP export of the events below, and the hooks do that only when you opt in:
+
+- `TREEPROOF_OTLP_ENDPOINT=http://...` sends to that endpoint;
+- the generic `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` are used only together with `TREEPROOF_OTEL=1`. (Before 0.1.2 the hooks also exported when only the generic variable was set; if you have it set for other tools, 0.1.2 stops that.)
+- `TREEPROOF_OTEL=0` turns every export off, including `TREEPROOF_OTLP_ENDPOINT`.
+
+What is sent: the three evaluation results, their explanations, and the git tree id. No source, test output, file names or environment values. `treeproof otel` (run by hand) also reads the generic variables, because you asked it to export.
 
 `treeproof otel` and the `Stop` hook can emit OpenTelemetry `gen_ai.evaluation.result` events (`verification.exit_code`, `verification.fs_diff`, `verification.test_rerun`, labelled `verified`, `contradicted` or `unknown`) over OTLP/HTTP JSON, linked to the host span through `TRACEPARENT` when one is present. CI sends them to a real OpenTelemetry Collector and checks what arrives. See [docs/otel.md](docs/otel.md).
 

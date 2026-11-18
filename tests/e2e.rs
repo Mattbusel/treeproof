@@ -683,6 +683,18 @@ fn agents_cannot_feed_hooks_or_touch_the_key() {
 #[test]
 fn mcp_server_runs_queries_and_verifies() {
     let e = Env::new();
+    // receipt_run only runs committed commands (or a recognised runner); pin the fixture runner.
+    std::fs::write(
+        e.repo.join("treeproof.toml"),
+        format!(
+            "[gate]
+commands = [\"{} run_tests.py\"]
+",
+            python()
+        ),
+    )
+    .unwrap();
+    commit_all(&e.repo, "pin");
     let mut c = e.cmd(&e.repo);
     c.arg("mcp").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = c.spawn().unwrap();
@@ -718,6 +730,151 @@ fn mcp_server_runs_queries_and_verifies() {
     let o = child.wait_with_output().unwrap();
     let v: Value = serde_json::from_str(String::from_utf8_lossy(&o.stdout).lines().next().unwrap()).unwrap();
     assert_eq!(v["result"]["structuredContent"]["ok"], true, "{v}");
+}
+
+fn mcp(e: &Env, msgs: &[Value]) -> Vec<Value> {
+    let mut c = e.cmd(&e.repo);
+    c.arg("mcp").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    for m in msgs {
+        writeln!(stdin, "{m}").unwrap();
+    }
+    drop(stdin);
+    let o = child.wait_with_output().unwrap();
+    String::from_utf8_lossy(&o.stdout).lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+}
+
+#[test]
+fn mcp_receipt_run_rejects_arbitrary_commands() {
+    let e = Env::new();
+    let marker = e.repo.join("pwned.txt");
+    let call =
+        |id: i64, args: Value| json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"receipt_run","arguments":args}});
+    let cmdline = format!("{} run_tests.py", python());
+    let write_marker = format!("{} -c open('pwned.txt','w').write('x')", python());
+    let out = mcp(
+        &e,
+        &[
+            // Not a recognised runner and nothing is pinned.
+            call(1, json!({"command": cmdline, "cwd": e.repo})),
+            call(2, json!({"argv": [python(), "-c", "open('pwned.txt','w').write('x')"], "cwd": e.repo})),
+            call(3, json!({"command": write_marker, "cwd": e.repo})),
+            call(4, json!({"command": "cargo test && echo hi > pwned.txt", "cwd": e.repo})),
+        ],
+    );
+    assert_eq!(out.len(), 4);
+    for r in &out {
+        assert_eq!(r["result"]["isError"], true, "{r}");
+        assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("receipt_run refused"), "{r}");
+    }
+    assert!(!marker.exists());
+    assert_eq!(e.executions(), 0);
+
+    // Once the command is committed in [gate] commands it runs; other commands still do not.
+    std::fs::write(
+        e.repo.join("treeproof.toml"),
+        format!(
+            "[gate]
+commands = [\"{cmdline}\"]
+"
+        ),
+    )
+    .unwrap();
+    commit_all(&e.repo, "pin");
+    let out = mcp(&e, &[call(5, json!({"command": cmdline, "cwd": e.repo})), call(6, json!({"command": "cargo test", "cwd": e.repo}))]);
+    assert_eq!(out[0]["result"]["structuredContent"]["result"], "PASSED", "{}", out[0]);
+    assert_eq!(out[1]["result"]["isError"], true, "{}", out[1]);
+    assert!(out[1]["result"]["content"][0]["text"].as_str().unwrap().contains("not one of the committed [gate] commands"));
+    assert_eq!(e.executions(), 1);
+}
+
+#[test]
+fn rerun_does_not_trust_keys_from_the_checkout() {
+    let e = Env::new();
+    // A cloned repository signs its own receipt and ships the public key in the working copy.
+    let attacker_key = e.home.join("attacker.key");
+    let mut c = e.cmd(&e.repo);
+    c.env("TREEPROOF_KEY_FILE", &attacker_key).args(["run", "--", python(), "run_tests.py"]);
+    let o = c.output().unwrap();
+    assert!(o.status.success(), "{}", stderr(&o));
+    let src = stderr(&o).lines().find_map(|l| l.strip_prefix("treeproof: receipt ").map(|s| s.trim().to_string())).unwrap();
+    let kdir = e.repo.join(".treeproof").join("trusted_keys");
+    std::fs::create_dir_all(&kdir).unwrap();
+    let mut c = e.cmd(&e.repo);
+    c.env("TREEPROOF_KEY_FILE", &attacker_key).args(["key", "export"]);
+    std::fs::write(kdir.join("repo.pem"), c.output().unwrap().stdout).unwrap();
+    let receipt = e.repo.join("evil-receipt.json");
+    std::fs::copy(&src, &receipt).unwrap();
+    // Make sure this user's own key exists and is a different key.
+    assert!(e.cmd(&e.repo).args(["key", "init"]).output().unwrap().status.success());
+    let before = e.executions();
+
+    // MCP receipt_verify with rerun: the checkout key is not trusted, nothing is executed.
+    let out = mcp(
+        &e,
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"receipt_verify","arguments":{"receipt": receipt, "cwd": e.repo, "rerun": true}}}),
+        ],
+    );
+    let v = &out[0]["result"]["structuredContent"];
+    assert_eq!(v["ok"], false, "{v}");
+    assert_eq!(v["signature_ok"], false, "{v}");
+    assert!(v["rerun"].is_null(), "{v}");
+    assert_eq!(e.executions(), before, "the receipt's command must not run");
+
+    // CLI verify --rerun: same rule.
+    let o = e.cmd(&e.repo).args(["verify", "--rerun", receipt.to_str().unwrap()]).output().unwrap();
+    assert_eq!(o.status.code(), Some(1), "{}{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("signature does not verify"), "{}", stdout(&o));
+    assert_eq!(e.executions(), before, "the receipt's command must not run");
+
+    // Without --rerun the checkout key still verifies the signature (nothing is executed).
+    let o = e.cmd(&e.repo).args(["verify", receipt.to_str().unwrap()]).output().unwrap();
+    assert!(o.status.success(), "{}{}", stdout(&o), stderr(&o));
+    // A key the user trusts from outside the repository works for a re-run.
+    let mut c = e.cmd(&e.repo);
+    c.env("TREEPROOF_TRUSTED_KEYS", kdir.join("repo.pem")).args(["verify", "--rerun", receipt.to_str().unwrap()]);
+    let o = c.output().unwrap();
+    assert!(o.status.success(), "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(e.executions(), before + 1);
+}
+
+#[test]
+fn hooks_ignore_generic_otel_endpoint_without_opt_in() {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.set_nonblocking(true).unwrap();
+    let ep = format!("http://{}", l.local_addr().unwrap());
+    let e = Env::new();
+    std::fs::write(
+        e.repo.join("lib.txt"),
+        "changed
+",
+    )
+    .unwrap();
+    let mut c = e.cmd(&e.repo);
+    c.env("OTEL_EXPORTER_OTLP_ENDPOINT", &ep).env_remove("TREEPROOF_OTEL").arg("hook").stdin(Stdio::piped()).stdout(Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(json!({"hook_event_name": "Stop", "session_id": "otel", "cwd": e.repo}).to_string().as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap();
+    assert!(l.accept().is_err(), "the Stop hook exported without TREEPROOF_OTEL=1");
+    // With the explicit opt-in it does export.
+    let mut c = e.cmd(&e.repo);
+    c.env("OTEL_EXPORTER_OTLP_ENDPOINT", &ep).env("TREEPROOF_OTEL", "1").arg("hook").stdin(Stdio::piped()).stdout(Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(json!({"hook_event_name": "Stop", "session_id": "otel2", "cwd": e.repo}).to_string().as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap();
+    assert!(l.accept().is_ok(), "the Stop hook did not export with TREEPROOF_OTEL=1");
 }
 
 #[test]

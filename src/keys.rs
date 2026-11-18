@@ -124,6 +124,15 @@ pub fn trusted_keys(repo: Option<&Path>, include_local: bool, extra: &[PublicKey
     Ok(out)
 }
 
+/// Keys trusted when a receipt's command is going to be re-run: this machine's signing key,
+/// `TREEPROOF_TRUSTED_KEYS` and `extra` (keys the user named, for example `--key`).
+///
+/// Never keys from the working copy's `.treeproof/trusted_keys/`: a cloned repository could
+/// otherwise sign its own receipt and have its command executed. Same rule as the local gate.
+pub fn rerun_trusted_keys(extra: &[PublicKey]) -> Result<Vec<PublicKey>> {
+    trusted_keys(None, true, extra)
+}
+
 /// Keys listed in `TREEPROOF_TRUSTED_KEYS`.
 fn env_trusted_keys(add: &mut impl FnMut(PublicKey)) -> Result<()> {
     if let Some(list) = std::env::var_os("TREEPROOF_TRUSTED_KEYS") {

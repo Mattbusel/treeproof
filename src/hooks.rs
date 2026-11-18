@@ -139,12 +139,38 @@ fn session_of(input: &Value) -> String {
     str_field(input, "session_id").unwrap_or("default").to_string()
 }
 
+/// When run from the plugin, compare the plugin's version with this binary's. The plugin is
+/// released together with the binary of the same version; a different `treeproof` on `PATH`
+/// is reported, not trusted silently.
+pub fn plugin_version_mismatch(plugin_root: Option<&Path>) -> Option<String> {
+    let root = plugin_root?;
+    let text = std::fs::read_to_string(root.join(".claude-plugin").join("plugin.json"))
+        .or_else(|_| std::fs::read_to_string(root.join(".codex-plugin").join("plugin.json")))
+        .ok()?;
+    let want = serde_json::from_str::<Value>(&text).ok()?.get("version")?.as_str()?.to_string();
+    let have = env!("CARGO_PKG_VERSION");
+    (want != have).then(|| {
+        format!(
+            "treeproof: the plugin is {want} but the treeproof binary on PATH is {have}. Install the matching binary: cargo install treeproof --version {want} --locked (or the v{want} release archive, checked against its SHA256SUMS)."
+        )
+    })
+}
+
 fn session_start(input: &Value) -> Result<HookOutput> {
     let cwd = cwd_of(input);
-    let Ok(root) = crate::git::repo_root(&cwd) else { return Ok(HookOutput::silent()) };
+    let warn = plugin_version_mismatch(std::env::var_os("CLAUDE_PLUGIN_ROOT").map(PathBuf::from).as_deref());
+    let Ok(root) = crate::git::repo_root(&cwd) else {
+        return Ok(match warn {
+            Some(w) => HookOutput { stdout: Some(json!({"systemMessage": w})), exit_code: 0 },
+            None => HookOutput::silent(),
+        });
+    };
     let store = Store::open()?;
     ensure_state(&store, &session_of(input), &root)?;
-    Ok(HookOutput::silent())
+    Ok(match warn {
+        Some(w) => HookOutput { stdout: Some(json!({"systemMessage": w})), exit_code: 0 },
+        None => HookOutput::silent(),
+    })
 }
 
 fn stop(input: &Value, ev: &str) -> Result<HookOutput> {
@@ -616,6 +642,21 @@ pub fn main(event: Option<&str>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_version_is_pinned_to_the_binary() {
+        let plugin = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin");
+        if plugin.is_dir() {
+            // The shipped plugin names this exact binary version.
+            assert_eq!(plugin_version_mismatch(Some(&plugin)), None);
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".claude-plugin")).unwrap();
+        std::fs::write(tmp.path().join(".claude-plugin").join("plugin.json"), r#"{"version":"9.9.9"}"#).unwrap();
+        let w = plugin_version_mismatch(Some(tmp.path())).unwrap();
+        assert!(w.contains("cargo install treeproof --version 9.9.9 --locked"), "{w}");
+        assert_eq!(plugin_version_mismatch(None), None);
+    }
 
     #[test]
     fn observable_commands() {
