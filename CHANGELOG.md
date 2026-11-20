@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3
+
+Positioning only; no behaviour change. The README now opens with the problem (an agent's "tests pass" is a claim, not a check) and a comparison with trusting the transcript, a stop hook that re-runs the whole suite, and CI after the push. New crates.io description and keywords. Install pins and the plugin, npm and Action versions move to 0.1.3.
+
 ## 0.1.2
 
 Fixes from the buildwithclaude plugin directory review. Upgrade the binary and the plugin together.

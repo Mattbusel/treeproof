@@ -2,7 +2,7 @@
 
 | Channel | Command | Notes |
 |---|---|---|
-| crates.io | `cargo install treeproof --version 0.1.2 --locked` | Builds from source; Rust 1.89 or newer. Pin the version and use `--locked`. |
+| crates.io | `cargo install treeproof --version 0.1.3 --locked` | Builds from source; Rust 1.89 or newer. Pin the version and use `--locked`. |
 | Release archives | [releases page](https://github.com/Mattbusel/treeproof/releases) | `x86_64`/`aarch64` Linux (static musl), macOS (Apple silicon, and Intel where the release lists it), Windows x64. Each release has a `SHA256SUMS` file; check it before unpacking. v0.1.0 has no Intel macOS archive; use `cargo install` there. |
 | PyPI | `pip install treeproof` | A wheel that contains only the binary (maturin `bindings = "bin"`). Built for every release; published once PyPI trusted publishing is enabled for the project. |
 | npm | `npm i -g treeproof` | A small launcher that downloads the matching release binary on install or first use. Published once an npm publishing credential is configured for the repository. |
@@ -14,7 +14,7 @@ The Claude Code and Codex hooks and the MCP entry run `treeproof` from `PATH`. I
 Release archive, checked:
 
 ```sh
-v=0.1.2
+v=0.1.3
 t=x86_64-unknown-linux-musl     # or aarch64-unknown-linux-musl, aarch64-apple-darwin, x86_64-apple-darwin
 curl -LO https://github.com/Mattbusel/treeproof/releases/download/v$v/treeproof-$t.tar.gz
 curl -LO https://github.com/Mattbusel/treeproof/releases/download/v$v/SHA256SUMS

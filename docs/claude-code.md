@@ -4,7 +4,7 @@ The treeproof plugin turns "done" into "done with a passing receipt for the curr
 
 ## Install
 
-1. Install the binary so it is on `PATH`, pinned to the plugin's version: `cargo install treeproof --version 0.1.2 --locked`, or the v0.1.2 release archive checked against its `SHA256SUMS` (see [install.md](install.md)). The hooks run whatever `treeproof` is on `PATH`; the `SessionStart` hook warns when that binary's version differs from the plugin's.
+1. Install the binary so it is on `PATH`, pinned to the plugin's version: `cargo install treeproof --version 0.1.3 --locked`, or the v0.1.3 release archive checked against its `SHA256SUMS` (see [install.md](install.md)). The hooks run whatever `treeproof` is on `PATH`; the `SessionStart` hook warns when that binary's version differs from the plugin's.
 2. In Claude Code:
 
    ```text

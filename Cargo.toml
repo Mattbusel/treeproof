@@ -1,14 +1,14 @@
 [package]
 name = "treeproof"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 rust-version = "1.89"
-description = "Signed test-result receipts for a git tree: in-toto test-result attestations, a cross-worktree result cache, and done-gates for coding agents (Claude Code, Codex, MCP, GitHub Actions)."
+description = "Your coding agent says the tests pass; nothing checks it ran them on this code. treeproof signs an in-toto receipt that this exact git tree passed this exact command, and gates \"done\" in Claude Code, Codex, MCP and GitHub Actions on it. 0 tests or a subset is FAILED."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Mattbusel/treeproof"
 documentation = "https://docs.rs/treeproof"
 readme = "README.md"
-keywords = ["in-toto", "attestation", "testing", "agents", "mcp"]
+keywords = ["testing", "agents", "claude-code", "in-toto", "ci-gate"]
 categories = ["development-tools::testing", "command-line-utilities", "cryptography"]
 include = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "README.md", "SPEC.md", "LICENSE-MIT", "LICENSE-APACHE", "docs/**"]
 

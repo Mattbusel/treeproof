@@ -1,26 +1,43 @@
-# treeproof
-
-**Signed test receipts for a git tree.** `treeproof run -- cargo test` runs your tests and signs an [in-toto test-result](https://github.com/in-toto/attestation/blob/main/spec/predicates/test-result.md) attestation that says *this exact working tree passed this exact command*. Coding-agent hosts gate "done" on it, CI re-runs it, and parallel worktrees share it through a cache keyed on the same digest.
+# treeproof: "all tests pass" is a claim until the tree proves it
 
 [![CI](https://github.com/Mattbusel/treeproof/actions/workflows/ci.yml/badge.svg)](https://github.com/Mattbusel/treeproof/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/treeproof.svg)](https://crates.io/crates/treeproof)
 
-## Why
+**Your coding agent says the tests pass. Nothing you run checks that it ran them, on this code, after its last edit.**
+It says so without running them, after running a subset, or before the edit that broke them. Both Claude Code and Codex
+have open issues about exactly this ([anthropics/claude-code#92505](https://github.com/anthropics/claude-code/issues/92505),
+[openai/codex#59490](https://github.com/openai/codex/issues/59490)). If "done" means "the agent said so", your review is
+the test suite.
 
-Coding agents say "all tests pass" without having run them, or after running a subset, or before their last edit. Both Claude Code and Codex have open issues about it (for example [anthropics/claude-code#92505](https://github.com/anthropics/claude-code/issues/92505) and [openai/codex#59490](https://github.com/openai/codex/issues/59490)). A hook that runs the whole suite on every stop is slow, and a hook that trusts the transcript can be talked past.
+`treeproof run -- cargo test` runs the command and signs an
+[in-toto test-result](https://github.com/in-toto/attestation/blob/main/spec/predicates/test-result.md) attestation:
+*this exact working tree passed this exact command*. The agent host refuses "done" without one, CI re-runs it, and
+parallel worktrees share it.
 
-treeproof turns "the tests passed" into a checkable fact:
+| "Done" means | Agent's word | Stop hook that re-runs everything | CI after the push | **treeproof** |
+|---|---|---|---|---|
+| The tests were run on the code being handed in | trusted | yes | yes, minutes later | **yes, signed, bound to the git tree id** |
+| An edit after the run is caught | no | yes | yes | **yes: the receipt goes stale** |
+| A subset or 0 collected tests counts as a pass | yes | depends on the hook | depends on the job | **no: `FAILED`** |
+| Cost when nothing changed | none | the whole suite, every stop | a CI run | **none: cache hit on the same tree** |
+| Four agents in four worktrees on one tree | four claims | four suite runs | four CI runs | **one run, shared** |
+
+treeproof takes the other side of "trust the transcript":
 
 - **Bound to the tree.** The receipt's subject is the git tree id of the working tree, including uncommitted and untracked files. Any edit after the run makes it stale.
 - **Signed.** Ed25519 over a DSSE envelope. The agent cannot hand-write a passing receipt.
-- **Strict.** 0 tests collected, everything filtered out, `--collect-only`, an unrecognised runner, or a non-zero exit is `FAILED`. Failures are never cached as passes. A run of part of the suite does not satisfy the gate, and a failing run blocks it until the same command passes.
+- **Fails closed.** 0 tests collected, everything filtered out, `--collect-only`, an unrecognised runner, or a non-zero exit is `FAILED`. Failures are never cached as passes. A run of part of the suite does not satisfy the gate, and a failing run blocks it until the same command passes.
 - **Shared.** Passing results live in a content-addressed store under your user cache directory. Four agents in four worktrees on the same tree run the suite once; identical runs started at the same time execute once and the rest wait for the result.
 - **Open format.** [`SPEC.md`](SPEC.md) defines the receipt so other tools can produce and verify it. CI checks treeproof's receipts with securesystemslib and the in-toto-attestation validators.
+
+Who it is for: anyone who lets Claude Code, Codex or an MCP agent mark work done, and maintainers who get agent-written
+pull requests. What it costs you: one binary on `PATH`, and a gate that will block an agent that has not run the suite.
+That is the point.
 
 ## Install
 
 ```sh
-cargo install treeproof --version 0.1.2 --locked
+cargo install treeproof --version 0.1.3 --locked
 ```
 
 Pin the version. The Claude Code plugin and its hooks call whatever `treeproof` is on `PATH`, so install the version that matches the plugin (the plugin's `SessionStart` hook warns when they differ). `--locked` builds with the dependency versions in the published `Cargo.lock`.
@@ -46,7 +63,7 @@ Supported runners: `cargo test` (libtest, including doctests), `cargo nextest`, 
 | Claude Code plugin | `Stop` and `TaskCompleted` hooks block completion until a passing receipt exists for the current tree; `PostToolUse` records test runs the agent made with Bash; FileGuard refuses edits to files that changed since the agent read them | [docs/claude-code.md](docs/claude-code.md) |
 | Codex hooks | Same gate and recording through Codex's `Stop`, `PostToolUse` and `PreToolUse` hooks | [docs/codex.md](docs/codex.md) |
 | MCP server | `receipt_run` (only the committed `[gate] commands` or a recognised test runner, never a general shell), `receipt_query`, `receipt_verify` for any MCP client | [docs/mcp.md](docs/mcp.md) |
-| GitHub Action | `uses: Mattbusel/treeproof/verify@v0.1.2` verifies the committed receipt against keys and policy from the base branch, re-runs its command on the checked-out tree, and fails on any mismatch | [docs/github-action.md](docs/github-action.md) |
+| GitHub Action | `uses: Mattbusel/treeproof/verify@v0.1.3` verifies the committed receipt against keys and policy from the base branch, re-runs its command on the checked-out tree, and fails on any mismatch | [docs/github-action.md](docs/github-action.md) |
 | Orchestrators | `treeproof gate --json`, `treeproof verify --json`, or the Rust crate | [docs/orchestrators.md](docs/orchestrators.md) |
 
 Claude Code:
@@ -56,7 +73,7 @@ Claude Code:
 /plugin install treeproof@treeproof
 ```
 
-The plugin calls the `treeproof` binary, so install that first, pinned to the plugin's version: `cargo install treeproof --version 0.1.2 --locked`.
+The plugin calls the `treeproof` binary, so install that first, pinned to the plugin's version: `cargo install treeproof --version 0.1.3 --locked`.
 
 **The gate is on in every git repository by default.** Once the plugin is enabled, any session that changes files in a git repository has to end with a passing `treeproof run` for that tree (or hits the 3-block limit and stops with a warning). To turn it off:
 

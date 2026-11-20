@@ -15,10 +15,10 @@ In Claude Code:
 The hooks and the MCP entry run the `treeproof` binary from `PATH`. Install the version this plugin was released with:
 
 ```sh
-cargo install treeproof --version 0.1.2 --locked
+cargo install treeproof --version 0.1.3 --locked
 ```
 
-Or download the v0.1.2 archive from the [release page](https://github.com/Mattbusel/treeproof/releases/tag/v0.1.2) and check it against that release's `SHA256SUMS` (`sha256sum -c SHA256SUMS --ignore-missing`). See [docs/install.md](../docs/install.md).
+Or download the v0.1.3 archive from the [release page](https://github.com/Mattbusel/treeproof/releases/tag/v0.1.3) and check it against that release's `SHA256SUMS` (`sha256sum -c SHA256SUMS --ignore-missing`). See [docs/install.md](../docs/install.md).
 
 The `SessionStart` hook prints a warning when the `treeproof` on `PATH` is a different version from this plugin.
 

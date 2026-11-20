@@ -1,6 +1,6 @@
 {
   "name": "treeproof",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Signed test receipts for the current git tree, a Stop gate that requires a fresh passing receipt, and the receipt_run/receipt_query/receipt_verify MCP tools.",
   "hooks": "./hooks/codex-hooks.json"
 }
